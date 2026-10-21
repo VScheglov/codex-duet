@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "tests", "responses", "questions"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "What you changed in this turn and why, in a few sentences; say plainly what is not done yet."
+    },
+    "tests": {
+      "type": "string",
+      "description": "The commands you ran to verify the work and their outcome; \"not run\" with the reason if you could not run them."
+    },
+    "responses": {
+      "type": "array",
+      "description": "One entry per review issue listed in the prompt; empty in the first turn.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "action", "note"],
+        "properties": {
+          "id": { "type": "string", "description": "The issue id from the review, e.g. C1." },
+          "action": {
+            "type": "string",
+            "enum": ["fixed", "disputed", "needs-user"],
+            "description": "fixed = changed on disk; disputed = the issue does not hold (give evidence); needs-user = the owner has to decide."
+          },
+          "note": { "type": "string", "description": "What changed and where (path:line), or the evidence for a dispute." }
+        }
+      }
+    },
+    "questions": {
+      "type": "array",
+      "description": "Open questions for the architect or the owner; empty if none.",
+      "items": { "type": "string" }
+    }
+  }
+}

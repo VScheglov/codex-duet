@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings", "coverage", "notes"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "1-5 sentences: the overall result of the audit, the answer to the task's question."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Most important first; [] when nothing the task asks about is wrong.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "title", "body", "location", "recommendation", "confidence"],
+        "properties": {
+          "id": { "type": "string", "description": "A1, A2, ... in the order given." },
+          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "title": { "type": "string", "description": "One line." },
+          "body": { "type": "string", "description": "What is wrong or notable and the evidence you saw: code, command output, data, with exact references." },
+          "location": { "type": "string", "description": "path:start-end, a section, a table or query; empty if not applicable." },
+          "recommendation": { "type": "string", "description": "A concrete next step; empty if none." },
+          "confidence": { "type": "number", "description": "0..1, how sure you are that the finding holds." }
+        }
+      }
+    },
+    "coverage": {
+      "type": "string",
+      "description": "What you examined and how; what you could not examine and why."
+    },
+    "notes": {
+      "type": "string",
+      "description": "Anything else the task asked for (a ranking, a table, answers to its questions) as Markdown; empty if nothing."
+    }
+  }
+}

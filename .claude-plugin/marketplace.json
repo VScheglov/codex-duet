@@ -1,0 +1,15 @@
+{
+  "name": "codex-duet",
+  "description": "codex-duet: a Claude ↔ Codex review loop in which the two settle each issue between themselves",
+  "owner": {
+    "name": "Vladimir Scheglov",
+    "url": "https://github.com/VScheglov"
+  },
+  "plugins": [
+    {
+      "name": "codex-duet",
+      "source": "./",
+      "description": "Claude ↔ Codex review loop with per-issue negotiation for plans, code and files, with a live pane"
+    }
+  ]
+}

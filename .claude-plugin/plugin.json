@@ -1,0 +1,33 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "codex-duet",
+  "version": "0.10.0",
+  "description": "Claude ↔ Codex review loop with per-issue negotiation for plans, code and files, with a live pane",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Vladimir Scheglov",
+    "url": "https://github.com/VScheglov"
+  },
+  "homepage": "https://github.com/VScheglov/codex-duet",
+  "repository": "https://github.com/VScheglov/codex-duet",
+  "license": "MIT",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Interface language: auto uses the first nonempty LC_ALL, LC_MESSAGES or LANG, then the first macOS AppleLanguages entry; falls back to English.",
+      "options": ["auto", "en", "ru", "zh"],
+      "default": "auto"
+    }
+  },
+  "keywords": [
+    "codex",
+    "code-review",
+    "review",
+    "delegation",
+    "mod"
+  ],
+  "skills": [
+    "./"
+  ]
+}

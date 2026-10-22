@@ -375,8 +375,9 @@ await test('C1: a lock left by a crashed run goes to exactly one of two racers',
   const payload = responses('fixed', [{ id: 'C1', action: 'fixed', note: 'done' }]);
   const racers = await Promise.all([1, 2].map(() => duetAsync(['reply', '--session', sid, '--responses', '-'], { cwd: tmp, env, input: payload })));
   if (process.platform !== 'darwin') {
-    // without O_EXLOCK a stale lock is never broken automatically
+    // without O_EXLOCK a stale lock is never broken automatically; a person deletes it, as the error says
     for (const r of racers) assert.match(r.err, /stale lock/);
+    fs.rmSync(path.join(home, sid, 'lock'));
     return;
   }
   assert.deepEqual(racers.map((r) => r.code).sort(), [0, 2]);
@@ -393,11 +394,17 @@ await test('a cancelled round says so and can be retried', async () => {
     cwd: tmp, env: { CODEX_DUET_KILL_GRACE_MS: '300', CODEX_DUET_TIMEOUT_MS: '20000' },
   });
   let lock = null;
+  let holder = 0;
   await waitFor(() => {
-    lock = fs.readdirSync(home).map((d) => path.join(home, d, 'lock')).find((f) => fs.existsSync(f) && fs.readFileSync(f, 'utf8'));
+    // the running call's lock: on Linux another session's lock can be left with a dead pid, and readdir has no order;
+    // the pid is kept, never read again, since a released lock reads empty and kill(0) would hit the whole group
+    for (const f of fs.readdirSync(home).map((d) => path.join(home, d, 'lock'))) {
+      const pid = fs.existsSync(f) ? Number(fs.readFileSync(f, 'utf8')) : 0;
+      if (pid > 0 && isAlive(pid)) [lock, holder] = [f, pid];
+    }
     return lock && fs.existsSync(fakeState) && calls().length === 1;
   });
-  process.kill(Number(fs.readFileSync(lock, 'utf8')), 'SIGTERM');
+  process.kill(holder, 'SIGTERM');
   const r = await run;
   assert.equal(r.code, 1);
   assert.match(r.err, /cancelled: codex-duet received SIGINT or SIGTERM \(often the Bash tool's limit/);

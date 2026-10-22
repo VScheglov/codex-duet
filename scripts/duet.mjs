@@ -1433,10 +1433,20 @@ async function cmdReview(o) {
   }
 }
 
+// The spec's title becomes the subject as written: a cut at a fixed width split real titles mid-phrase. Only a
+// spec that opens with a paragraph instead of a heading is cut, at a word boundary, to keep the subject a line.
+const SUBJECT_MAX = 120;
+
 function specTitle(st) {
-  const first = fs.readFileSync(st.subject.spec, 'utf8').split('\n').map((l) => l.replace(/^#+\s*/, '').trim()).find(Boolean);
-  return (first || 'implementation').slice(0, 72);
+  const first = fs.readFileSync(st.subject.spec, 'utf8').split('\n').map((l) => l.replace(/^#+\s*/, '').trim()).find(Boolean) || 'implementation';
+  if (first.length <= SUBJECT_MAX) return first;
+  const head = first.slice(0, SUBJECT_MAX);
+  const space = head.lastIndexOf(' ');
+  return `${(space > SUBJECT_MAX / 2 ? head.slice(0, space) : head).trimEnd()}…`;
 }
+
+// The runner's commit names itself once: a title that starts with codex-duet already does.
+const commitSubject = (title) => (/^codex-duet\b/i.test(title) ? title : `codex-duet: ${title}`);
 
 async function cmdFinish(o) {
   const { id } = resolveSession(o.session);
@@ -1449,7 +1459,7 @@ async function cmdFinish(o) {
     if (!fs.existsSync(worktree)) throw new UsageError(`the worktree is gone already (phase: ${st.phase})`);
     git(['add', '-A'], { cwd: worktree });
     if (git(['diff', '--cached', '--quiet'], { cwd: worktree, allowFail: true }).status !== 0) {
-      git(['commit', '-q', '-m', `codex-duet: ${specTitle(st)}`, '-m',
+      git(['commit', '-q', '-m', commitSubject(specTitle(st)), '-m',
         `Implemented by Codex, reviewed by Claude in ${st.round} round(s); session ${st.id}.`], { cwd: worktree });
     }
     const head = git(['rev-parse', 'HEAD'], { cwd: worktree }).stdout.trim();

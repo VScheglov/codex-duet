@@ -561,6 +561,29 @@ await test('build: approval ends the loop; finish commits on the branch and remo
   assert.equal(spawnSync('git', ['log', '-1', '--format=%s', subject.branch], { cwd: repo, encoding: 'utf8' }).stdout.trim(), 'codex-duet: Greeting');
 });
 
+await test('build: finish keeps the spec title whole and names codex-duet once; only a paragraph without a heading is cut', () => {
+  const subjectOf = (spec) => {
+    scriptCodex([{ ...author('done'), write: { 'note.txt': `${spec.length}\n` } }]);
+    const r = duet(['start', '--kind', 'build', '--subject', '-'], { input: spec });
+    assert.equal(r.code, 0, r.err);
+    const id = sessionId(r.out);
+    scriptCodex([]);
+    const approved = duet(['review', '--session', id, '--issues', '-'], { input: reviewJSON('approve', []) });
+    assert.match(approved.out, /Decision: DONE/, approved.err);
+    const f = duet(['finish', '--session', id], { env: gitIdentity });
+    assert.equal(f.code, 0, f.err);
+    return spawnSync('git', ['log', '-1', '--format=%s', state(id).subject.branch], { cwd: repo, encoding: 'utf8' }).stdout.trim();
+  };
+  // the title that came out as "codex-duet: codex-duet 0.10.0: … Simplified Chinese by"
+  const named = 'codex-duet 0.10.0: English by default, Russian and Simplified Chinese by setting';
+  assert.equal(subjectOf(`# ${named}\n\nBody.\n`), named);
+  const long = 'Add a greeting helper that also trims names, folds their case and handles empty input';
+  assert.equal(subjectOf(`# ${long}\n`), `codex-duet: ${long}`);
+  const cut = subjectOf(`${'word '.repeat(40)}end\n`);
+  assert.match(cut, /^codex-duet: (word )+word…$/);
+  assert.ok(cut.length <= 'codex-duet: '.length + 120, cut);
+});
+
 await test('build: discard removes the worktree and deletes the branch', () => {
   scriptCodex([{ ...author('started'), write: { 'tmp.txt': 'x\n' } }]);
   const r = duet(['start', '--kind', 'build', '--subject', '-', '--branch', 'try/discard'], { input: 'Try something\n' });

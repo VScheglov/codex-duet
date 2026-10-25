@@ -189,7 +189,9 @@ reply ─► Codex（同一会话，resume）：resolved · withdrawn · open + 
 
 自动继续和摘要只在负责该审查的 Claude 会话中生效。
 
-code 审查或 build 进行期间（最后一轮之后的 12 小时内视为活跃），任何 Claude 会话都不能在该仓库中执行 `git commit`、`push` 或 `stash`（build 模式下限制作用于其 worktree）。在审查项目中，你的消息会附带会话摘要，以便 Claude 在压缩上下文后仍能继续循环。后台任务通知不会附带摘要，因为运行器输出已经包含所需内容。
+code 审查或 build 进行期间（最后一轮之后的 12 小时内视为活跃），任何 Claude 会话都不能在该仓库中执行 `git commit`、`push` 或 `stash`（build 模式下限制作用于其 worktree）。保护机制会解析实际执行的 shell 命令，包括引号内的路径、`cd`/`pushd`、Git 全局选项、环境变量赋值、命令包装器、复合命令、命令替换、`eval`、shell 的 `-c` 参数以及传给 shell 的 heredoc。同时指定 Git 目录和工作树时，只要其中任一路径位于受保护的目录树中，写入就会被阻止。引号内的普通提及、注释、作为数据的 heredoc、`stash list` 和 `stash show` 可以通过。只要存在受保护的会话，目录依赖变量、命令替换或通配符的 Git 写入就会被阻止。如果解析失败（例如嵌套过深），只要存在受保护的会话，包含 `git` 一词的命令就会被阻止；其他命令可以通过。Git 别名（`git ci`、`git -c alias.x=commit x`）、执行提交的脚本和 Makefile（`sh release.sh`、`npm run release`），以及其他在运行时拼装的命令不会被识别。这一机制用于防止 Claude 意外违反自身规则，并非沙箱。
+
+在审查项目中，你的消息会附带会话摘要，以便 Claude 在压缩上下文后仍能继续循环。后台任务通知不会附带摘要，因为运行器输出已经包含所需内容。
 
 命令：`/duet` 打开面板；`/duet stop` 停止当前一轮（之后可以通过 `retry` 继续）；`/duet band|toasts|score|sound on|off` 开启或关闭界面的对应部分（面板底部折叠“设置”中的按钮作用相同）；`/duet sound test` 或“▶ 声音”按钮依次播放三种提示音。模块不会写入会话文件，只会留下一个用于调试的单行 `.ui-trace.json` 文件。
 

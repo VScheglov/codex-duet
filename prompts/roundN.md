@@ -38,6 +38,9 @@ Also:
 - Raise new issues only for material problems, especially ones introduced by the latest changes. The next free id is {{NEXT_ID}}.
 - Return every issue listed in author_responses plus any new or reopened ones. Leave out issues closed in earlier rounds.
 - The rules from the first round still apply: run whatever checks you are allowed to, but never edit the subject or change external systems; evidence for every claim.
+- Report every verification bearing on this verdict in checks with the exact command as run, outcome passed|failed|skipped and note (reason for failures or skips). Include checks you wanted but did not run as skipped with the reason; exclude file reads and searches. The runner compares checks with the commands you actually ran in the saved events.
+- Run each check so its own exit is the command's exit. Do not pipe checks through tail/head, append || true, or append ; echo: piped or masked checks remain unconfirmed even when the full command matches an event. Redirect output to a file if needed and inspect it in a separate command.
+- Include gaps for parts not examined, or examined only partly. Both checks and gaps are required; use [] when none.
 - verdict and summary as in the first round. Return only JSON that matches the provided schema.
 </rules_for_this_round>
 

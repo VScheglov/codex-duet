@@ -38,7 +38,7 @@ Pass it on stdin: `start --kind build --subject - <<'DUET_SPEC'` … `DUET_SPEC`
 
 ## Reviewing on a budget
 
-1. Read the summary: what Codex claims, which tests it ran, its questions.
+1. Read the summary and the `Tests:` verification receipt, not just Codex's test claim: commands, passed/failed/skipped outcomes and reasons, confirmations against saved events, and gaps. The label describes the last real Codex turn: `executed` = all checks confirmed with no skips or gaps (including confirmed failures), `partial` = some confirmed with incomplete coverage, `static-analysis-only` = none confirmed, `unknown` = older reply. Claude's own checks are outside this label; it never changes the stop decision.
 2. Read the round diff in the summary. Past the size limit it is truncated; inspect the rest per file with the `git -C … diff … -- <path>` command shown above it.
 3. Open a whole file only when the diff cannot be judged without its context.
 4. Run the acceptance tests in the worktree yourself: `cd <worktree> && <test command>`. Command output costs little and checks Codex's claims.
@@ -91,7 +91,9 @@ Use `matches` when the owner settles that the request is met, or `narrowed-accep
 
 ## Finish or discard
 
-After `DONE` (or whenever the user decides to stop), present the result and ask:
+After `DONE` (or whenever the user decides to stop), present the result and its verification label, explaining failed or missing checks and gaps when it is not `executed`, then ask. A post-approval round has no receipt; summaries, reports and the pane retain the latest real Codex turn's label.
+
+The choices are:
 
 - `finish --session <id>` commits only the approved content on its branch with the spec title as the subject and removes the worktree; the summary prints how to look at, merge or drop the branch. It compares the worktree and the resulting commit tree with the approved snapshot. Drift, including content changed by commit hooks, leaves no commit on the branch and returns the changes as a new review round: continue with the printed `review` command. The paths are labeled `covered`, `edited-after-review`, or `never-reviewed`.
 - Without an approval, finish refuses. Use `finish --unreviewed --session <id>` only on the owner's explicit word to commit the current content anyway; the commit body and report record the round and phase. `verify --session <id>` checks the worktree against the approval without finishing (or checks the branch commit after the worktree is removed).

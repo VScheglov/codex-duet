@@ -201,6 +201,35 @@ for (const language of LANGUAGES) {
   }
 }
 
+for (const language of LANGUAGES) {
+  for (const surface of SURFACES) {
+    test(`DONE verification on ${surface} in ${language}: the phase wraps and the gaps stay visible after post-approval`, { options: { language } }, async ($, on) => {
+      const state = {
+        ...JSON.parse(STATE), owner: 'claude-me', kind: 'build', phase: 'done', round: 2, issues: {},
+        subject: { repo: '/work/csv-import', branch: 'receipt', worktree: '/work/receipt' },
+        rounds: [
+          { n: 1, verification: { label: 'static-analysis-only', checks: [
+            { command: 'npm run integration', outcome: 'skipped', note: 'Missing credentials', confirmation: 'skipped' },
+          ], gaps: ['Browser path not examined'] } },
+          { n: 2, kind: 'post-approval', verdict: 'approve' },
+        ],
+      }
+      const expected = {
+        en: '✅ done · verification: static-analysis-only',
+        ru: '✅ готово · проверка: только статический анализ',
+        zh: '✅ 已完成 · 验证：仅静态分析',
+      }
+      const ui = await paneOver($, on, surface, { [`${ID}/state.json`]: JSON.stringify(state) })
+      const phase = await ui.find({ type: 'Text', text: expected[language] })
+      expect(phase).toBeDefined()
+      expect(phase?.props.wrap).toBe('wrap')
+      expect(await ui.find({ type: 'Text', text: /npm run integration — Missing credentials$/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /Browser path not examined$/ })).toBeDefined()
+      await ui.unmount()
+    })
+  }
+}
+
 // A turn that runs: Codex's words as markdown, its plan and commands, on every surface.
 const RUNNING = JSON.stringify({ ...JSON.parse(STATE), phase: 'awaiting-codex', updatedAt: '2026-10-18T17:29:00.000Z',
   pending: { round: 2, startedAt: '2026-10-18T17:21:17.000Z' } })

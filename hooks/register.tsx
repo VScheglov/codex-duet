@@ -62,6 +62,27 @@ const clip = (text: string, width: number) => (text.length > width ? `${text.sli
 const tail = (file: string) => String(file).split('/').filter(Boolean).slice(-2).join('/')
 const isBlocking = (issue: DuetIssue) => (SEVERITY_RANK[issue.severity] ?? 0) >= SEVERITY_RANK.high
 
+function phaseWithVerification(view: DuetView) {
+  const label = view.phase === 'done' && view.verification
+    ? locale.verificationStatus(locale.verificationLabels[view.verification.label]) : ''
+  return `${phaseLabel(view.phase)}${label ? ` · ${label}` : ''}`
+}
+
+// Up to two detail lines explain why the last Codex turn was only partly verified.
+function verificationDetails(view: DuetView) {
+  const receipt = view.verification
+  if (!receipt || !['partial', 'static-analysis-only'].includes(receipt.label)) return []
+  const checks = receipt.checks.flatMap((check) => {
+    const status = check.outcome === 'skipped' ? 'skipped'
+      : check.confirmation === 'contradicted' || check.confirmation === 'unconfirmed' ? check.confirmation
+      : check.outcome === 'failed' ? 'failed' : null
+    if (!status) return []
+    const exit = check.event?.exit_code
+    return [`${locale.verificationChecks[status]}: ${oneLine(check.command)}${exit != null ? ` (exit ${exit})` : ''}${check.note ? ` — ${oneLine(check.note)}` : ''}`]
+  })
+  return [checks.join('; '), receipt.gaps.length ? locale.verificationGaps(receipt.gaps.map(oneLine).join('; ')) : ''].filter(Boolean)
+}
+
 function clock(ms: number) {
   const s = Math.max(0, Math.round(ms / 1000))
   const m = Math.floor(s / 60)
@@ -419,6 +440,9 @@ function buildView(st: any, now: number, live: Liveness | null, digest: Digest |
     decision: st.decision
       ? { action: st.decision.action, reason: oneLine(st.decision.reason), issues: st.decision.issues ?? [] }
       : null,
+    verification: st.kind === 'audit' ? null
+      : (st.rounds ?? []).findLast((r: any) => r.kind !== 'post-approval')?.verification
+        ?? { label: 'unknown', checks: [], gaps: [] },
     issues,
     rounds,
     activity: digest?.activity ?? [],
@@ -783,7 +807,7 @@ function taskLine(v: DuetView) {
   if (v.runningRound) return locale.taskRunning(v.label, v.runningRound, v.maxRounds, clock(v.elapsedMs), model)
   if (v.phase === 'escalated') return locale.taskEscalated(v.label, (v.decision?.issues ?? []).join(', '))
   if (v.kind === 'audit' && v.phase === 'done') return locale.taskAuditDone(v.label, v.findings.length)
-  return locale.taskOther(phaseLabel(v.phase), v.label, v.round, v.maxRounds)
+  return locale.taskOther(phaseWithVerification(v), v.label, v.round, v.maxRounds)
 }
 
 // Several tasks at once: one short line each, so the note stays small.
@@ -916,7 +940,9 @@ export const register: Register = (on, options) => {
     const below = await next(e)
     const view: DuetView | null = await read($, viewAtom)
     const prefs: DuetPrefs = { ...DEFAULT_PREFS, ...(await read($, prefsAtom)) }
-    if (e.props.hasSurvey || !view?.isActive || !view.isMine || !prefs.band) return below
+    const recentDone = view?.phase === 'done' && view.kind !== 'audit'
+      && (await $.clock.now()) - Date.parse(view.updatedAt) < RECENT_MS
+    if (e.props.hasSurvey || !view || (!view.isActive && !recentDone) || !view.isMine || !prefs.band) return below
     const { Box, Button, Text } = $.ui.resolve(e)
     const width = Math.max(20, (e.props.bodyColumns ?? e.viewport?.columns ?? 80) - 10)
     let line = locale.bandAuthor(view.round, view.maxRounds, view.issues.filter((i) => i.status === 'open' && !i.parked).length)
@@ -937,6 +963,9 @@ export const register: Register = (on, options) => {
     } else if (view.phase === 'codex-failed') {
       line = locale.bandFailed(view.failure)
       color = 'red'
+    } else if (view.phase === 'done') {
+      line = `${phaseWithVerification(view)} · codex-duet · r${view.round}/${view.maxRounds}`
+      color = 'green'
     }
     // the others go into a count; the pane lists them
     const others = ((await read($, listAtom)) ?? []).filter((v: DuetView) => v.isActive && v.id !== view.id).length
@@ -1050,7 +1079,7 @@ export const register: Register = (on, options) => {
       ? locale.phaseGone
       : view.isQueued
         ? locale.phaseQueued(view.queuedAhead, clock(view.elapsedMs))
-        : `${view.runningRound && view.kind === 'build' ? locale.phaseBuild : view.runningRound && view.kind === 'audit' ? locale.phaseAudit : phaseLabel(view.phase)}${view.runningRound ? ` · ${clock(view.elapsedMs)}` : ''}`
+        : `${view.runningRound && view.kind === 'build' ? locale.phaseBuild : view.runningRound && view.kind === 'audit' ? locale.phaseAudit : phaseWithVerification(view)}${view.runningRound ? ` · ${clock(view.elapsedMs)}` : ''}`
     const tasks = list.length > 1 ? (
       <Box flexDirection="column">
         <Text weight="semibold" wrap="wrap">
@@ -1146,6 +1175,9 @@ export const register: Register = (on, options) => {
               <Button key="stop" label={locale.stopButton} onPress={() => { void stopRound($, view).then((text) => $.ui.toast(text)) }} />
             ) : null}
           </Box>
+          {!view.runningRound ? verificationDetails(view).map((text, n) => (
+            <Text key={`verification-${n}`} color="yellow" wrap="wrap">{text}</Text>
+          )) : null}
           {view.decision && !view.runningRound ? <Text dimColor wrap="wrap">{locale.decision(view.decision.action, view.decision.reason)}</Text> : null}
           {view.failure ? <Text color="red" wrap="wrap">{view.failure}</Text> : null}
           {diag.error ? <Text color="red" wrap="wrap">{locale.readErrorStale(diag.error)}</Text> : null}

@@ -31,6 +31,8 @@ For narrowed, name each gap in notes with a quote of the owner's words and also 
 - {{TOOLING}}
 - Never edit the files under review, commit, push, stash or switch branches, and never change external systems (databases, services, tickets) through any tool, MCP servers included. This is a review: propose fixes as issues; the author makes them.
 - Ground every issue in what you actually inspected. If an issue rests on inference, say so in the body and lower the confidence.
+- Report every verification bearing on your verdict in checks, with the exact shell command as run (tests, builds, linters, type checks, scripts, bug reproductions; not file reads or searches). The runner compares checks with the commands you actually ran in the saved events.
+- Run each check so its own exit is the command's exit. Do not pipe checks through tail/head, append || true, or append ; echo: piped or masked checks remain unconfirmed even when the full command matches an event. Redirect output to a file if needed and inspect it in a separate command.
 </how_to_work>
 
 <finding_bar>
@@ -47,6 +49,8 @@ Skip style, naming and formatting unless they cause real misunderstanding. One s
 - verdict: "approve" if nothing remains that you would block on; otherwise "revise".
 - summary: 1-3 sentences, a terse ship / no-ship assessment.
 - request_check: {"status": "matches|narrowed|unclear|no-brief", "notes": "your separate check of the owner's request"} is required.
+- checks: [{"command": "exact shell command", "outcome": "passed|failed|skipped", "note": "reason"}] is required. Include checks you wanted but did not run as skipped with a reason; explain failures in note. Use [] if none.
+- gaps: list the parts not examined, or examined only partly; [] when none.
 - Write titles, bodies and replies in the natural language of the subject (English if unclear).
 - Return only JSON that matches the provided schema.
 </output_contract>

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "issues", "request_check"],
+  "required": ["verdict", "summary", "issues", "request_check", "checks", "gaps"],
   "properties": {
     "request_check": {
       "type": "object",
@@ -12,6 +12,25 @@
         "status": { "type": "string", "enum": ["matches", "narrowed", "unclear", "no-brief"] },
         "notes": { "type": "string", "description": "Check the owner's request, accepted amendments and claimed result separately. Quote each narrowed requirement and also raise it as a Request: issue; for unclear say why and what would settle it." }
       }
+    },
+    "checks": {
+      "type": "array",
+      "description": "Every verification bearing on the verdict (tests, builds, linters, type checks, scripts, reproductions), not file reads or searches. The runner compares these with saved command events. Run each check so its own exit is the command's exit: no | tail, || true, or ; echo. Piped or masked checks remain unconfirmed; redirects are allowed.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "outcome", "note"],
+        "properties": {
+          "command": { "type": "string", "description": "The exact shell command as run, or the intended command when skipped." },
+          "outcome": { "type": "string", "enum": ["passed", "failed", "skipped"] },
+          "note": { "type": "string", "description": "Short reason for a failure or skipped check; empty when no explanation is needed." }
+        }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "description": "Parts of the subject or task not examined, or only partly examined; [] when none.",
+      "items": { "type": "string" }
     },
     "verdict": {
       "type": "string",

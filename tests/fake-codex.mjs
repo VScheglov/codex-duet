@@ -9,6 +9,9 @@
 //                      any entry may add "descendant": "stdout" | "quiet": a child that ignores
 //                      SIGTERM and either keeps our stdout open or holds no pipe at all,
 //                      "write": {"file": "text"}: files the implementer writes (build mode),
+//                      "commands": [{"command": "node --test", "exit_code": 0, "status": "completed"}]:
+//                      shell events only (never executed); completed: false emits just the start,
+//                      rawCommand overrides the usual /bin/zsh -lc wrapper for shell-format tests,
 //                      and "tier": "priority": the service tier logged for the turn, as Codex 0.160 logs it
 //                      in $CODEX_HOME/sessions/…/rollout-…-<thread>.jsonl before the thread is named;
 //                      a "hang" entry with "started": true names its thread (and logs a "tier") first,
@@ -54,6 +57,16 @@ if (!step || step.fail) {
   process.exit(1);
 }
 const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
+function emitCommands() {
+  for (const [i, entry] of (step.commands ?? []).entries()) {
+    const command = entry.rawCommand ?? `/bin/zsh -lc '${entry.command.replace(/'/g, "'\\''")}'`;
+    const item = { id: `command_${i}`, type: 'command_execution', command };
+    emit({ type: 'item.started', item: { ...item, exit_code: null, status: 'in_progress' } });
+    if (entry.completed === false) continue;
+    const exit_code = Object.hasOwn(entry, 'exit_code') ? entry.exit_code : 0;
+    emit({ type: 'item.completed', item: { ...item, exit_code, status: entry.status ?? (exit_code === 0 ? 'completed' : 'failed') } });
+  }
+}
 const resume = args[0] === 'exec' && args[1] === 'resume';
 const threadId = resume ? args[2] : crypto.randomUUID();
 if (step.hang) {
@@ -61,6 +74,7 @@ if (step.hang) {
     if (step.tier) logSettings(threadId, step.tier);
     emit({ type: 'thread.started', thread_id: threadId });
   }
+  emitCommands();
   if (step.descendant) stubbornDescendant(step.descendant);
   if (step.ignoreTerm) process.on('SIGTERM', () => {});
   setInterval(() => {}, 1000);
@@ -68,6 +82,7 @@ if (step.hang) {
   if (step.tier) logSettings(threadId, step.tier);
   emit({ type: 'thread.started', thread_id: threadId });
   emit({ type: 'turn.started' });
+  emitCommands();
   if (step.delayMs) await new Promise((resolve) => setTimeout(resolve, step.delayMs));
   // build mode: the implementer edits files in its working directory, the worktree
   for (const [file, text] of Object.entries(step.write ?? {})) fs.writeFileSync(path.join(process.cwd(), file), text);

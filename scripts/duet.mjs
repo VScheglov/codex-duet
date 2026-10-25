@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { confirmVerification, unknownVerification, verificationClaims, verificationLines } from './verification.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(SELF), '..');
@@ -902,8 +903,8 @@ function runCodex(st, round, prompt, threadId, schema = SCHEMA) {
       process.off('SIGINT', cancel);
       process.off('SIGTERM', cancel);
       if (buffer) events.write(buffer); // a last line without its newline, as it came
-      events.end();
-      errors.end();
+      // Receipts read the saved events after this promise resolves: wait for both files to flush.
+      await Promise.all([new Promise((done) => events.end(done)), new Promise((done) => errors.end(done))]);
       resolve({ ...result, ...extra });
     };
     process.on('SIGINT', cancel);
@@ -1015,6 +1016,7 @@ function normalizeReply(raw) {
     summary: String(raw.summary || '').trim(),
     issues: [...issues.values()],
     request_check: normalizeRequestCheck(raw.request_check),
+    ...verificationClaims(raw),
   };
 }
 
@@ -1284,6 +1286,7 @@ async function runRound(st, round, payload) {
     verdict: reply.verdict,
     summary: reply.summary,
     request_check: reply.request_check,
+    verification: await confirmVerification(reply, path.join(sessionDir(st.id), `round-${round}.events.jsonl`)),
     snapshot: snap,
     startedAt,
     finishedAt: now(),
@@ -1372,10 +1375,11 @@ function normalizeAuthorReply(raw) {
   }
   return {
     summary: String(raw.summary || '').trim() || '(no summary)',
-    tests: String(raw.tests || '').trim() || '(not reported)',
+    tests: typeof raw.tests === 'string' ? raw.tests.trim() : undefined, // legacy replies only
     responses: [...responses.values()],
     questions: (Array.isArray(raw.questions) ? raw.questions : []).map((q) => String(q).trim()).filter(Boolean),
     request_check: normalizeRequestCheck(raw.request_check, false),
+    ...verificationClaims(raw),
   };
 }
 
@@ -1456,6 +1460,7 @@ async function runBuildTurn(st, round, review) {
   st.rounds.push({
     n: round,
     author: { summary: reply.summary, tests: reply.tests, questions: reply.questions, request_check: reply.request_check },
+    verification: await confirmVerification(reply, path.join(sessionDir(st.id), `round-${round}.events.jsonl`)),
     snapshot: takeSnapshot(st, round),
     startedAt,
     finishedAt: now(),
@@ -1482,7 +1487,9 @@ function renderBuildSummary(st, approvalCheck = null) {
     ...requestCheckLines(st),
   ];
   if (st.phase === 'awaiting-review') {
-    L.push(`${last.kind === 'post-approval' ? 'Changes' : 'Codex'}: ${indent(last.author.summary)}`, `Tests: ${indent(last.author.tests)}`);
+    L.push(`${last.kind === 'post-approval' ? 'Changes' : 'Codex'}: ${indent(last.author.summary)}`);
+    if (last.kind === 'post-approval') L.push(`Last Codex turn: round ${lastCodexRound(st)?.n ?? 'unknown'}`);
+    L.push(...verificationLines(codexVerification(st), 'Tests', lastCodexRound(st)?.author?.tests));
     if (last.pathStates) L.push(...pathStateLines(last.pathStates));
     if (last.author.questions.length) L.push('Questions:', ...last.author.questions.map((q) => `- ${indent(q)}`));
     const answers = Object.values(st.issues).filter((i) => i.author?.round === st.round).sort(byPriority);
@@ -1506,7 +1513,7 @@ function renderBuildSummary(st, approvalCheck = null) {
       diff.length > REVIEW_DIFF_LIMIT ? `${diff.slice(0, REVIEW_DIFF_LIMIT)}\n... (truncated: inspect the rest per file with the command above)` : (diff.trim() || '(no changes)'),
       '```',
       '',
-      "Next: review (read files in the worktree where needed, run the tests there), independently check the owner's request and accepted amendments in the spec, then run:",
+      "Next: read the verification receipt, review (read files in the worktree where needed, run the tests there), independently check the owner's request and accepted amendments in the spec, then run:",
       'Approval requires request_check; if narrowed, raise an issue for each gap instead of approving.',
       '```bash',
       `node "${SELF}" review --session ${st.id} --issues - <<'DUET_JSON'`,
@@ -1522,7 +1529,8 @@ function renderBuildSummary(st, approvalCheck = null) {
   }
   const d = st.decision;
   if (last.verdict) L.push(`Your verdict: ${last.verdict} — ${last.summary}`);
-  if (d) L.push(`Decision: ${d.action.toUpperCase()} — ${d.reason}${d.enforced ? ' (enforced by duet.mjs)' : ''}`);
+  if (d) L.push(`Decision: ${d.action.toUpperCase()} — ${d.reason}${d.enforced ? ' (enforced by duet.mjs)' : ''} · verification: ${codexVerification(st).label}`);
+  L.push(...verificationLines(codexVerification(st), 'Tests', lastCodexRound(st)?.author?.tests));
   const open = openIssues(st);
   const parked = parkedIssues(st);
   if (open.length) L.push('', `### Open (${open.length})`, ...open.map((i) => `- ${i.id} [${i.severity}] ${i.title}`));
@@ -1945,9 +1953,12 @@ const requestRulingLine = (st) => st.requestRuling
   : '(none recorded)';
 
 function codexRequestCheck(st) {
-  const last = st.kind === 'build' ? st.rounds.findLast((r) => r.kind !== 'post-approval') : st.rounds.at(-1);
+  const last = lastCodexRound(st);
   return normalizeRequestCheck(st.kind === 'build' ? last?.author?.request_check : last?.request_check, st.kind !== 'build');
 }
+
+const lastCodexRound = (st) => st.rounds.findLast((r) => r.kind !== 'post-approval');
+const codexVerification = (st) => lastCodexRound(st)?.verification ?? unknownVerification();
 
 function requestCheckLines(st) {
   const L = st.kind !== 'build' && !st.brief ? ['Owner brief: none'] : [];
@@ -1975,7 +1986,8 @@ function renderSummary(st) {
     modelLine(st),
     `Codex verdict: ${last.verdict} — ${last.summary}`,
     ...requestCheckLines(st),
-    `Decision: ${d.action.toUpperCase()} — ${d.reason}${d.enforced ? ' (enforced by duet.mjs)' : ''}`,
+    `Decision: ${d.action.toUpperCase()} — ${d.reason}${d.enforced ? ' (enforced by duet.mjs)' : ''} · verification: ${codexVerification(st).label}`,
+    ...verificationLines(codexVerification(st)),
   ];
   if (closedNow.length) {
     L.push('', `### Closed this round (${closedNow.length})`);
@@ -2038,6 +2050,15 @@ function renderReport(st) {
     ...(st.kind === 'build' ? [`Claude: ${requestCheckText(normalizeBuildReviewCheck(st.rounds.findLast((r) => r.verdict)?.request_check))}`] : []),
     ...(st.requestRuling ? [requestRulingLine(st)] : []),
     '',
+    '## Verification',
+    '',
+    ...st.rounds.filter((r) => r.kind !== 'post-approval').map((r) => `- Round ${r.n}: ${r.verification?.label ?? 'unknown'}`),
+    '',
+    `Last Codex turn: round ${lastCodexRound(st)?.n ?? 'unknown'}`,
+    ...verificationLines(codexVerification(st), 'Verification', lastCodexRound(st)?.author?.tests),
+    '',
+    '## Issues',
+    '',
     '| ID | Severity | Title | Outcome | Rounds |',
     '|---|---|---|---|---|',
     ...all.map((i) => `| ${i.id} | ${i.severity} | ${cell(i.title)} | ${outcome(i, st)} | ${i.openedRound}–${i.closedRound ?? st.round} |`),
@@ -2057,7 +2078,11 @@ function renderReport(st) {
     L.push('', '## Round history');
     for (const r of st.rounds) {
       L.push('', `### Round ${r.n}${r.kind === 'post-approval' ? ' · post-approval' : ''}`);
-      if (r.author) L.push(`${r.kind === 'post-approval' ? 'Changes' : 'Codex'}: ${r.author.summary}`, `Tests: ${r.author.tests}`);
+      if (r.author) {
+        L.push(`${r.kind === 'post-approval' ? 'Changes' : 'Codex'}: ${r.author.summary}`);
+        if (r.kind !== 'post-approval') L.push(`Tests: ${r.verification?.label ?? 'unknown'}`);
+        if (r.kind !== 'post-approval' && !r.verification && r.author.tests) L.push(`Legacy Tests claim (unconfirmed): ${oneLine(r.author.tests)}`);
+      }
       if (r.snapshot?.tree) L.push(`Snapshot tree: ${r.snapshot.tree}`);
       if (r.diffBase) L.push(`This round: ${r.diffBase} → ${r.snapshot.tree}`);
       if (r.pathStates) L.push(...pathStateLines(r.pathStates));

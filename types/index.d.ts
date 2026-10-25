@@ -19,6 +19,19 @@ export type DuetIssue = {
 
 export type DuetRound = { n: number; verdict: string; seconds: number; open: number; tokens: number }
 
+export type DuetVerification = {
+  label: 'executed' | 'partial' | 'static-analysis-only' | 'unknown'
+  checks: {
+    command: string
+    outcome: 'passed' | 'failed' | 'skipped'
+    note: string
+    confirmation: 'confirmed' | 'contradicted' | 'unconfirmed' | 'skipped'
+    event?: { command: string; exit_code: number | null; status: string | null }
+    events?: { command: string; exit_code: number | null; status: string | null }[] // compound check, one event per segment
+  }[]
+  gaps: string[]
+}
+
 // One finding of an audit (--kind audit); the evidence and the recommendation stay in the session's report.md.
 export type DuetFinding = { id: string; severity: string; title: string; location: string }
 
@@ -55,6 +68,7 @@ export type DuetView = {
   isProcessGone: boolean
   failure: string
   decision: { action: string; reason: string; issues: string[] } | null
+  verification: DuetVerification | null // the latest real Codex turn; null for audits
   issues: DuetIssue[]
   findings: DuetFinding[] // an audit's, [] for every other kind
   result: string // an audit's summary, '' for every other kind

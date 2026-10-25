@@ -114,6 +114,8 @@ If there is no cache, the check is skipped. To switch the model or effort during
 
 Instructions for Claude are in `references/build.md`.
 
+In review and build, DONE carries a verification label: `executed` (all checks confirmed, no skips or gaps), `partial` (some confirmed, coverage incomplete), `static-analysis-only` (none confirmed), or `unknown` (older reply). Receipts compare claimed commands with saved events and show outcomes, skips with reasons, unconfirmed or contradicted claims, and gaps in summaries, `report.md` and `/duet`. Confirmed failures can still be `executed`; the label never changes the stop decision and excludes Claude’s own build-review checks.
+
 ## Audit mode: Codex checks without changing anything
 
 ```

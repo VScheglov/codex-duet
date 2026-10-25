@@ -116,6 +116,8 @@ echo '{"language":"ru"}' | claude plugin configure codex-duet --values-stdin
 
 给 Claude 的详细说明在 `references/build.md` 中。
 
+在 review 和 build 中，DONE 旁会显示验证标签：`executed`（所有检查均已确认，无跳过项或覆盖缺口）、`partial`（部分已确认，覆盖不完整）、`static-analysis-only`（无已确认检查）或 `unknown`（旧回复）。验证记录将声明的命令与保存的事件对照，在摘要、`report.md` 和 `/duet` 中显示结果、跳过原因、未确认或与事件矛盾的声明及覆盖缺口。已确认的失败也可标为 `executed`；标签不改变停止决定，也不包含 Claude 在 build 审查中自行运行的检查。
+
 ## audit 模式：Codex 只检查，不修改
 
 ```

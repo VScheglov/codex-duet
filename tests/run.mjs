@@ -6,6 +6,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { confirmVerification } from '../scripts/verification.mjs';
+import { matchingTests, normalizationTests } from './verification.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DUET = path.join(HERE, '..', 'scripts', 'duet.mjs');
@@ -102,6 +104,9 @@ async function test(name, fn) {
   passed += 1;
   console.log(`ok - ${name}`);
 }
+
+await matchingTests(test, tmp);
+await normalizationTests(test, tmp);
 
 fs.mkdirSync(repo);
 git(['init', '-q']);
@@ -1766,6 +1771,318 @@ await test('time: no limit per Codex turn by default; --timeout-min sets one, an
   const bad = duet(['start', '--kind', 'file', '--subject', 'timed.md', '--timeout-min', '-5'], { cwd: tmp });
   assert.equal(bad.code, 2);
   assert.match(bad.err, /--timeout-min must be a whole number \(0: no limit\)/);
+});
+
+// ---- verification receipts: only completed commands in this attempt's saved events are evidence
+const check = (command, outcome = 'passed', note = '') => ({ command, outcome, note });
+const withReceipt = (step, checks, gaps = [], commands = []) => ({
+  ...step, reply: { ...step.reply, checks, gaps }, commands,
+});
+function receiptReview(checks, gaps = [], commands = []) {
+  scriptCodex([withReceipt(turn('approve', []), checks, gaps, commands)]);
+  const result = duet(['start', '--kind', 'file', '--subject', 'a.js'], { env: realPolicy });
+  assert.equal(result.code, 0, result.err);
+  const sid = sessionId(result.out);
+  return { ...result, sid, receipt: state(sid).rounds[0].verification,
+    report: fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8') };
+}
+
+await test('verification: agreeing passed and failed checks are executed, shown at DONE and saved in the report', () => {
+  const r = receiptReview([check('node --test'), check('node repro.mjs', 'failed', 'Reproduced the reported crash')], [], [
+    { command: 'node --test', exit_code: 0 }, { command: 'node repro.mjs', exit_code: 1 },
+    { command: 'cat README.md', exit_code: 0 }, // reads are not claimed checks
+  ]);
+  assert.equal(r.receipt.label, 'executed');
+  assert.deepEqual(r.receipt.checks.map((c) => c.confirmation), ['confirmed', 'confirmed']);
+  assert.deepEqual(r.receipt.checks[1].event, { command: 'node repro.mjs', exit_code: 1, status: 'failed' });
+  assert.match(r.out, /^Decision: DONE.* · verification: executed$/m);
+  assert.match(r.out, /Verification: executed\n\n- passed \[confirmed; exit 0; completed\]: node --test/);
+  assert.match(r.out, /failed \[confirmed; exit 1; failed\]: node repro.mjs — Reproduced the reported crash/);
+  assert.match(r.report, /## Verification\n\n- Round 1: executed/);
+  assert.match(r.report, /failed \[confirmed; exit 1; failed\]: node repro.mjs — Reproduced the reported crash/);
+  assert.match(duet(['status', '--session', r.sid]).out, /verification: executed/);
+  const events = fs.readFileSync(path.join(home, r.sid, 'round-1.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(events.some((e) => e.type === 'item.started' && e.item.command === "/bin/zsh -lc 'node --test'"));
+  assert.ok(events.some((e) => e.type === 'item.completed' && e.item.exit_code === 1 && e.item.status === 'failed'));
+});
+
+await test('verification: unrelated later commands cannot hide a failing check in the summary or report', () => {
+  const r = receiptReview([check('pytest tests/test_tools.py')], [], [
+    { command: 'pytest tests/test_tools.py', exit_code: 1 }, { command: 'ls', exit_code: 0 },
+  ]);
+  assert.equal(r.receipt.label, 'static-analysis-only');
+  assert.equal(r.receipt.checks[0].confirmation, 'contradicted');
+  assert.equal(r.receipt.checks[0].event.command, 'pytest tests/test_tools.py');
+  for (const text of [r.out, r.report]) assert.match(text, /passed \[contradicted; exit 1; failed\]: pytest tests\/test_tools.py/);
+});
+
+await test('verification: masked segment exits remain unconfirmed in the summary and report', () => {
+  const r = receiptReview([check('pytest -q'), check('npm test'), check('make lint'), check('go test ./...')], [], [
+    { command: 'pytest -q | tail -5', exit_code: 0 }, { command: 'npm test || true', exit_code: 0 },
+    { command: 'make lint; echo done', exit_code: 0 }, { command: 'cd pkg && go test ./...', exit_code: 0 },
+  ]);
+  assert.equal(r.receipt.label, 'partial');
+  assert.deepEqual(r.receipt.checks.map((c) => c.confirmation), ['unconfirmed', 'unconfirmed', 'unconfirmed', 'confirmed']);
+  assert.match(r.out, /^Decision: DONE.*verification: partial$/m);
+  for (const text of [r.out, r.report]) {
+    assert.match(text, /passed \[unconfirmed\]: pytest -q/);
+    assert.match(text, /passed \[unconfirmed\]: npm test/);
+    assert.match(text, /passed \[unconfirmed\]: make lint/);
+    assert.match(text, /passed \[confirmed; exit 0; completed\]: go test/);
+  }
+});
+
+await test('verification: exact masked commands remain unconfirmed in the summary and report', () => {
+  const checks = ['pytest -q | tail -5', 'npm test || true', 'make lint; echo done'].map((command) => check(command));
+  const commands = checks.map(({ command }) => ({ command, exit_code: 0 }));
+  const r = receiptReview(checks, [], commands);
+  assert.equal(r.receipt.label, 'static-analysis-only');
+  assert.deepEqual(r.receipt.checks.map((c) => c.confirmation), ['unconfirmed', 'unconfirmed', 'unconfirmed']);
+  assert.match(r.out, /^Decision: DONE.*verification: static-analysis-only$/m);
+  for (const text of [r.out, r.report]) {
+    for (const { command } of checks) assert.ok(text.includes(`passed [unconfirmed; exit 0; completed]: ${command}`), text);
+  }
+});
+
+await test('verification: malformed receipts do not fail review or build turns or change their decisions', () => {
+  const checks = [check('node --test'), { command: 'npm run lint', outcome: 'passed' }, null];
+  const commands = [{ command: 'node --test', exit_code: 0 }];
+  const file = receiptReview(checks, 'not an array', commands);
+  assert.equal(state(file.sid).phase, 'done');
+  assert.equal(file.receipt.label, 'partial');
+  assert.equal(file.receipt.checks.length, 1);
+  for (const text of [file.out, file.report]) {
+    assert.match(text, /2 malformed checks dropped/);
+    assert.match(text, /malformed gaps ignored/);
+  }
+  scriptCodex([withReceipt(author('Implemented.'), checks, 'not an array', commands)]);
+  const start = duet(['start', '--kind', 'build', '--subject', '-'], { input: requestSpec, env: realPolicy });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  assert.equal(state(sid).phase, 'awaiting-review');
+  assert.equal(state(sid).rounds[0].verification.label, 'partial');
+  assert.match(start.out, /2 malformed checks dropped/);
+  assert.match(start.out, /malformed gaps ignored/);
+  assert.match(approveBuild(sid).out, /Decision: DONE.*verification: partial/);
+  assert.equal(calls().length, 1, 'no retry or extra Codex turn');
+  assert.equal(duet(['discard', '--session', sid]).code, 0);
+});
+
+await test('verification: skips and gaps each make a confirmed turn partial and explain the missing coverage', () => {
+  for (const [skips, gaps] of [
+    [[check('npm run integration', 'skipped', 'Missing credentials')], []],
+    [[], ['Windows paths were not examined']],
+    [[check('npm run integration', 'skipped', 'Missing credentials')], ['Windows paths were not examined']],
+  ]) {
+    const r = receiptReview([check('node --test'), ...skips], gaps, [{ command: 'node --test', exit_code: 0 }]);
+    assert.equal(r.receipt.label, 'partial');
+    assert.match(r.out, /^Decision: DONE.*verification: partial$/m);
+    for (const text of [r.out, r.report]) {
+      if (skips.length) assert.match(text, /skipped: npm run integration — Missing credentials/);
+      if (gaps.length) assert.match(text, /Gap: Windows paths were not examined/);
+    }
+    if (skips.length) assert.equal(r.receipt.checks[1].confirmation, 'skipped');
+  }
+});
+
+await test('verification: empty, skipped, contradicted or unmatched checks alone are static-analysis-only', () => {
+  for (const [checks, commands] of [
+    [[], [{ command: 'node --test', exit_code: 0 }]], // do not invent checks from events
+    [[check('npm test', 'skipped', 'Sandbox denied execution')], [{ command: 'npm test', exit_code: 0 }]],
+    [[check('npm test')], [{ command: 'npm test', exit_code: 1 }]],
+    [[check('npm test')], []],
+  ]) {
+    const r = receiptReview(checks, [], commands);
+    assert.equal(r.receipt.label, 'static-analysis-only');
+    assert.match(r.out, /^Decision: DONE.*verification: static-analysis-only$/m);
+    assert.match(r.report, /Round 1: static-analysis-only/);
+    if (checks[0]?.outcome === 'skipped') assert.match(r.out, /Sandbox denied execution/);
+  }
+});
+
+await test('verification: conflicting exits, missing events, unfinished commands and unknown exits stay visible', () => {
+  const r = receiptReview([
+    check('node --test'), check('npm run lint'), check('npm run build', 'failed', 'Compiler error claimed'),
+    check('npm run integration'), check('npm run smoke'), check('npm run unknown', 'failed', 'No exit available'),
+  ], [], [
+    { command: 'node --test', exit_code: 0 }, { command: 'npm run lint', exit_code: 1 },
+    { command: 'npm run build', exit_code: 0 }, { command: 'npm run smoke', completed: false },
+    { command: 'npm run unknown', exit_code: null, status: 'failed' },
+  ]);
+  assert.equal(r.receipt.label, 'partial');
+  assert.deepEqual(r.receipt.checks.map((c) => c.confirmation), [
+    'confirmed', 'contradicted', 'contradicted', 'unconfirmed', 'unconfirmed', 'unconfirmed',
+  ]);
+  for (const text of [r.out, r.report]) {
+    assert.match(text, /passed \[contradicted; exit 1; failed\]: npm run lint/);
+    assert.match(text, /failed \[contradicted; exit 0; completed\]: npm run build — Compiler error claimed/);
+    assert.match(text, /passed \[unconfirmed\]: npm run integration/);
+    assert.match(text, /passed \[unconfirmed\]: npm run smoke/);
+    assert.match(text, /failed \[unconfirmed; exit unknown; failed\]: npm run unknown/);
+  }
+});
+
+await test('verification: shell wrappers, escaped quotes, whitespace, complete segments and the last match', () => {
+  const quoted = "node -e 'assert.equal(1, 1)'";
+  const r = receiptReview([
+    check('npm test -- --runInBand'), check('npm run lint -- --quiet'), check(quoted), check('node repro.mjs', 'failed', 'Last attempt failed'),
+  ], [], [
+    { command: 'npm test', rawCommand: 'bash -lc "cd app && npm  test -- --runInBand"', exit_code: 0 },
+    { command: 'npm run lint -- --quiet', rawCommand: '/bin/bash -lc "npm run lint -- --quiet"', exit_code: 0 },
+    { command: quoted, exit_code: 0 },
+    { command: 'node repro.mjs', exit_code: 0 }, { command: 'node repro.mjs', exit_code: 2 },
+  ]);
+  assert.equal(r.receipt.label, 'executed');
+  assert.equal(r.receipt.checks[2].event.command, quoted);
+  assert.equal(r.receipt.checks[3].event.exit_code, 2);
+});
+
+await test('verification: large streams are read through, ignoring malformed lines and unrelated events', async () => {
+  const file = path.join(tmp, 'large.events.jsonl');
+  const event = (command, exit_code) => JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command, exit_code, status: exit_code ? 'failed' : 'completed' } });
+  fs.writeFileSync(file, [
+    event('node early.mjs', 0), 'not JSON', 'null',
+    JSON.stringify({ type: 'item.completed', item: { type: 'mcp_tool_call', command: 'node mcp.mjs', exit_code: 0 } }),
+    JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'x'.repeat(4_500_000) } }),
+    event('node late.mjs', 0), // intentionally no trailing newline
+  ].join('\n'));
+  const receipt = await confirmVerification({ checks: [check('node early.mjs'), check('node late.mjs'), check('node mcp.mjs')], gaps: [] }, file);
+  assert.equal(receipt.label, 'partial');
+  assert.deepEqual(receipt.checks.map((c) => c.confirmation), ['confirmed', 'confirmed', 'unconfirmed']);
+});
+
+await test('verification: build Tests block shows facts before review and keeps its label at DONE', () => {
+  const step = { reply: { summary: 'Implemented exports.', responses: [], questions: [], request_check: matchingRequest } };
+  scriptCodex([withReceipt(step, [
+    check('node --test'), check('npm run lint'), check('npm run integration', 'skipped', 'Missing credentials'),
+  ], ['Browser paths were only inspected'], [{ command: 'node --test', exit_code: 0 }, { command: 'npm run lint', exit_code: 1 }])]);
+  const start = duet(['start', '--kind', 'build', '--subject', '-'], { input: requestSpec, env: realPolicy });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  assert.match(start.out, /Tests: partial\n\n- passed \[confirmed/);
+  assert.match(start.out, /passed \[contradicted; exit 1; failed\]: npm run lint/);
+  assert.match(start.out, /skipped: npm run integration — Missing credentials/);
+  assert.match(start.out, /Gap: Browser paths were only inspected/);
+  assert.equal(state(sid).rounds[0].author.tests, undefined, 'new replies need no free-text tests field');
+  const reviewed = approveBuild(sid);
+  assert.match(reviewed.out, /^Decision: DONE.*verification: partial$/m);
+  assert.equal(state(sid).rounds[0].verification.label, 'partial');
+  const report = fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8');
+  assert.match(report, /## Verification\n\n- Round 1: partial/);
+  assert.match(report, /contradicted; exit 1; failed/);
+  assert.match(report, /Missing credentials/);
+  assert.equal(duet(['discard', '--session', sid]).code, 0);
+});
+
+await test('verification: legacy review/build replies and older round records stay unknown', () => {
+  for (const kind of ['file', 'build']) {
+    scriptCodex([kind === 'build' ? author('Older reply.') : turn('approve', [])]);
+    const start = duet(['start', '--kind', kind, '--subject', kind === 'build' ? '-' : 'a.js'], { input: kind === 'build' ? requestSpec : '', env: realPolicy });
+    assert.equal(start.code, 0, start.err);
+    const sid = sessionId(start.out);
+    assert.equal(state(sid).rounds[0].verification.label, 'unknown');
+    if (kind === 'build') {
+      assert.match(start.out, /Tests: unknown\n\n- Legacy Tests claim \(unconfirmed\): node --test: ok/);
+      assert.match(approveBuild(sid).out, /verification: unknown/);
+    } else assert.match(start.out, /verification: unknown/);
+    const old = state(sid);
+    delete old.rounds[0].verification;
+    fs.writeFileSync(path.join(home, sid, 'state.json'), JSON.stringify(old));
+    const status = duet(['status', '--session', sid]);
+    assert.equal(status.code, 0, status.err);
+    assert.match(status.out, /verification: unknown/);
+    assert.match(duet(['report', '--session', sid]).out, /Round 1: unknown/);
+    if (kind === 'build') assert.equal(duet(['discard', '--session', sid]).code, 0);
+  }
+});
+
+await test('verification: retry in the same review/build thread uses only the overwritten attempt events', () => {
+  for (const kind of ['file', 'build']) {
+    const reply = kind === 'build' ? author('Resumed.') : turn('approve', []);
+    scriptCodex([
+      { hang: true, started: true, tier: 'default', commands: [{ command: 'npm run earlier-only', exit_code: 0 }, { command: 'npm test', exit_code: 0 }] },
+      withReceipt(reply, [check('npm test'), check('node resumed.mjs'), check('npm run earlier-only')], [], [
+        { command: 'npm test', exit_code: 1 }, { command: 'node resumed.mjs', exit_code: 0 },
+      ]),
+    ]);
+    const start = duet(['start', '--kind', kind, '--subject', kind === 'build' ? '-' : 'a.js'], { input: kind === 'build' ? requestSpec : '', env: cutOff });
+    assert.equal(start.code, 1, start.err);
+    const sid = retrySid(start.err);
+    const thread = state(sid).pending.threadId;
+    const retry = duet(['retry', '--session', sid], { env: { CODEX_HOME: cutHome } });
+    assert.equal(retry.code, 0, retry.err);
+    assert.deepEqual(calls()[1].args.slice(0, 3), ['exec', 'resume', thread]);
+    const s = state(sid);
+    assert.equal(s.rounds.length, 1);
+    assert.equal(s.rounds[0].verification.label, 'partial');
+    assert.deepEqual(s.rounds[0].verification.checks.map((c) => c.confirmation), ['contradicted', 'confirmed', 'unconfirmed']);
+    assert.doesNotMatch(fs.readFileSync(path.join(home, sid, 'round-1.events.jsonl'), 'utf8'), /earlier-only.*exit_code/);
+    assert.match(calls()[1].prompt, /this resumed attempt's saved events/);
+    if (kind === 'build') assert.equal(duet(['discard', '--session', sid]).code, 0);
+  }
+});
+
+await test('verification: report lists each Codex round and gives the latest receipt', () => {
+  scriptCodex([
+    withReceipt(turn('revise', [issue('C1', 'open')]), [check('node first.mjs')], [], [{ command: 'node first.mjs', exit_code: 0 }]),
+    withReceipt(turn('approve', [issue('C1', 'resolved')]), [check('node second.mjs', 'skipped', 'No time')], ['Second path not examined']),
+  ]);
+  const start = duet(['start', '--kind', 'file', '--subject', 'a.js'], { env: realPolicy });
+  const sid = sessionId(start.out);
+  const next = duet(['reply', '--session', sid, '--responses', '-'], { input: responses('fixed', [{ id: 'C1', action: 'fixed', note: 'Fixed' }]), env: realPolicy });
+  assert.equal(next.code, 0, next.err);
+  assert.match(next.out, /verification: static-analysis-only/);
+  const report = duet(['report', '--session', sid]).out;
+  assert.match(report, /- Round 1: executed\n- Round 2: static-analysis-only/);
+  assert.match(report, /Last Codex turn: round 2\nVerification: static-analysis-only/);
+  assert.match(report, /skipped: node second.mjs — No time/);
+  assert.match(report, /Gap: Second path not examined/);
+});
+
+await test('verification: post-approval rounds have no receipt and retain the latest real Codex label', () => {
+  const dir = approvalRepo();
+  scriptCodex([withReceipt({ ...author('Implemented.'), write: { 'reviewed.txt': 'approved\n' } }, [
+    check('node --test'), check('npm run integration', 'skipped', 'Missing credentials'),
+  ], [], [{ command: 'node --test', exit_code: 0 }])]);
+  const start = duet(['start', '--kind', 'build', '--subject', '-'], { cwd: dir, input: requestSpec, env: realPolicy });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  approveBuild(sid);
+  fs.writeFileSync(path.join(state(sid).subject.worktree, 'reviewed.txt'), 'post approval\n');
+  const drift = duet(['finish', '--session', sid]);
+  assert.equal(drift.code, 0, drift.err);
+  assert.equal(state(sid).rounds.at(-1).kind, 'post-approval');
+  assert.equal(state(sid).rounds.at(-1).verification, undefined);
+  assert.match(drift.out, /Last Codex turn: round 1\nTests: partial/);
+  assert.match(drift.out, /Missing credentials/);
+  assert.match(approveBuild(sid).out, /^Decision: DONE.*verification: partial$/m);
+  assert.match(duet(['status', '--session', sid]).out, /verification: partial/);
+  const report = duet(['report', '--session', sid]).out;
+  const section = report.split('## Verification\n')[1].split('| ID |')[0];
+  assert.match(section, /Round 1: partial/);
+  assert.doesNotMatch(section, /Round 2:/);
+  assert.match(section, /Last Codex turn: round 1/);
+  assert.match(section, /Missing credentials/);
+  assert.equal(calls().length, 1);
+  assert.equal(duet(['discard', '--session', sid]).code, 0);
+});
+
+await test('verification: receipt labels never change stop decisions for the same verdict and issues', () => {
+  for (const [verdict, issues] of [['approve', []], ['revise', [issue('C1', 'open')]]]) {
+    let baseline;
+    for (const receipt of [null, { checks: [], gaps: [] },
+      { checks: [check('npm test', 'failed', 'Tests failed')], gaps: [] },
+      { checks: [check('npm test', 'skipped', 'Sandbox')], gaps: ['Not all paths read'] },
+      { checks: [check('npm test'), check('npm run lint')], gaps: [] },
+    ]) {
+      scriptCodex([{ reply: { ...turn(verdict, issues).reply, ...(receipt ?? {}) }, commands: [{ command: 'npm test', exit_code: 1 }] }]);
+      const start = duet(['start', '--kind', 'file', '--subject', 'a.js'], { env: realPolicy });
+      assert.equal(start.code, 0, start.err);
+      const d = state(sessionId(start.out)).decision;
+      baseline ??= d;
+      assert.deepEqual(d, baseline);
+    }
+  }
 });
 
 // ---- the user's stop policy (scripts/policy.mjs): one case per rule, plus rule order

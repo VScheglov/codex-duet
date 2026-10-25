@@ -23,6 +23,8 @@ DUET_JSON
 
 Issues whose titles start with `Request: ` identify something dropped, narrowed or contradicted from the owner's request, accepted amendments or claimed result. Answer them like any other issue: fix, dispute with evidence, or park for the owner. A dispute must quote the owner's words (and the accepted amendment with its source when relevant) to show why the requirement is still met; the author's narrower specification alone is not evidence. Codex re-assesses `request_check` each round. Without an owner request ruling, a latest check of `narrowed` prevents `DONE` and escalates even if the reviewer otherwise approves; `unclear` is shown but does not itself block `DONE`.
 
+The summary's `Verification:` receipt confirms Codex's claimed checks against the round's saved command events and lists failures, skips with reasons, unconfirmed or contradicted claims, and gaps. `executed` means all checks confirmed with no skips or gaps (including confirmed failures); `partial` means some confirmed with incomplete coverage; `static-analysis-only` means none confirmed; older replies are `unknown`. The label appears beside DONE, in `report.md` and in `/duet`; it never changes the stop decision. Present it to the owner, and explain the limits whenever it is not `executed`.
+
 ## Actions
 
 | action | meaning | what Codex does next |

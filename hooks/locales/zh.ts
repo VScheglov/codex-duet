@@ -8,6 +8,10 @@ export const zh: Locale = {
     'owner-decided': '所有者已决定',
   },
   status: { resolved: '已解决', withdrawn: '已撤回' },
+  verificationLabels: { executed: '已执行', partial: '部分执行', 'static-analysis-only': '仅静态分析', unknown: '未知' },
+  verificationStatus: (label: string) => `验证：${label}`,
+  verificationChecks: { skipped: '已跳过', failed: '失败', unconfirmed: '未确认', contradicted: '与事件矛盾' },
+  verificationGaps: (gaps: string) => `未完整检查：${gaps}`,
   phase: {
     starting: '… 正在启动',
     queued: '⏸ 排队中',

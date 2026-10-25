@@ -9,6 +9,10 @@ export const en = {
     'owner-decided': 'owner decision',
   },
   status: { resolved: 'resolved', withdrawn: 'withdrawn' },
+  verificationLabels: { executed: 'executed', partial: 'partial', 'static-analysis-only': 'static-analysis-only', unknown: 'unknown' },
+  verificationStatus: (label: string) => `verification: ${label}`,
+  verificationChecks: { skipped: 'skipped', failed: 'failed', unconfirmed: 'unconfirmed', contradicted: 'contradicted' },
+  verificationGaps: (gaps: string) => `Not examined fully: ${gaps}`,
   phase: {
     starting: '… starting',
     queued: '⏸ queued',

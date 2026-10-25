@@ -5,6 +5,7 @@ import { en } from './locales/en.ts'
 import type { Locale } from './locales/en.ts'
 import { ru } from './locales/ru.ts'
 import { zh } from './locales/zh.ts'
+import { gitWrites } from './shell.ts'
 
 import type { DuetChoice, DuetDiag, DuetIssue, DuetModel, DuetPlanStep, DuetPrefs, DuetRound, DuetView } from '../types'
 
@@ -42,8 +43,6 @@ const NARRATION_MAX = 1500 // Codex's latest words, wrapped in the pane: a few p
 const STALE_MS = 2 * 60_000 // words older than this show their age, and a stream quiet this long reads as thinking
 const BIG_STREAM = 3_500_000 // an event stream from this size on is read from its end (STREAM_TAIL bytes)
 const STREAM_TAIL = 2_000_000
-// `git [-C dir] [-c k=v] [--flags] commit|push|stash`: the subcommand, not a word in its arguments
-const GIT_WRITE = /\bgit(?:\s+(?:-C|-c)\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+(?:commit|push|stash)\b/
 
 const viewAtom = atom({ plugin: 'codex-duet', key: 'view' } as const, null)
 const listAtom = atom({ plugin: 'codex-duet', key: 'list' } as const, [])
@@ -709,14 +708,6 @@ async function sendDecisions($: EngineInterface, sessionId: string, kind: string
   $.ui.toast(locale.decisionsSent)
 }
 
-function commandDir(command: string, cwd: string, home: string) {
-  const dir = /\bgit\s+-C\s+("[^"]+"|'[^']+'|\S+)/.exec(command)?.[1]
-    ?? /(?:^|&&|;|\|\|)\s*cd\s+("[^"]+"|'[^']+'|\S+)/.exec(command)?.[1]
-  if (!dir) return cwd
-  const plain = dir.replace(/^["']|["']$/g, '').replace(/^~(?=\/|$)/, home)
-  return plain.startsWith('/') ? plain : `${cwd}/${plain}`
-}
-
 const covers = (root: string, dir: string) => dir === root || dir.startsWith(`${root}/`)
 
 // One folder inside the other: the review's repository and this Claude session are the same project.
@@ -874,10 +865,17 @@ export const register: Register = (on, options) => {
       loop.drives = true
       loop.ranSinceUser = true
     }
-    if (!GIT_WRITE.test(command) || !guarded.length) return next(e)
-    const home = (await $.env.get('HOME')) ?? ''
-    const dir = commandDir(command, await $.session.cwd(), home)
-    const hit = guarded.find((g) => covers(g.cwd, dir))
+    if (!guarded.length) return next(e)
+    let hit: (typeof guarded)[number] | undefined
+    try {
+      const home = (await $.env.get('HOME')) ?? ''
+      const writes = gitWrites(command, await $.session.cwd(), home)
+      hit = guarded.find((g) => writes.some((write) => write.dirs.some((dir) => dir === null || covers(g.cwd, dir))))
+    } catch {
+      // Excessive nesting or another unreadable command must not throw out of this gating hook.
+      // Fall back conservatively only for a Git mention while a session is guarded.
+      if (/\bgit\b/.test(command)) hit = guarded[0]
+    }
     if (!hit) return next(e)
     return {
       deny: locale.commitDenied(hit.cwd, hit.id, phaseLabel(hit.phase)),

@@ -15,6 +15,8 @@ const DUET = path.join(HERE, '..', 'scripts', 'duet.mjs');
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codex-duet-mod-')));
 const repo = path.join(tmp, 'repo');
 const elsewhere = path.join(tmp, 'elsewhere');
+const insideSpace = path.join(repo, 'in with space');
+const outsideSpace = path.join(tmp, 'elsewhere with space');
 const home = path.join(tmp, 'state');
 const scriptFile = path.join(tmp, 'codex-script.json');
 const fakeState = path.join(tmp, 'codex-calls.json');
@@ -71,6 +73,9 @@ async function test(name, fn) {
 
 fs.mkdirSync(repo);
 fs.mkdirSync(elsewhere);
+fs.mkdirSync(path.join(repo, 'sub'));
+fs.mkdirSync(insideSpace);
+fs.mkdirSync(outsideSpace);
 git(['init', '-q']);
 fs.writeFileSync(path.join(repo, 'a.js'), 'export const a = 1;\n');
 git(['add', 'a.js']);
@@ -133,6 +138,317 @@ await test('commit guard: no commit, push or stash in the reviewed repository; e
   assert.equal((await E.bash('git status')).result, 'core reached');
   assert.equal((await E.bash(`git -C ${elsewhere} commit -m x`)).result, 'core reached');
 });
+
+// Every row goes through tool.call, without ever executing the supplied command on the host.
+const writeActions = ['commit -m x', 'push', 'stash'];
+const writeForms = [
+  (action) => `git ${action}`,
+  (action) => `git -C "${insideSpace}" ${action}`,
+  (action) => `git -C '${repo}' ${action}`,
+  (action) => `git -C sub -C .. ${action}`,
+  (action) => `git -c user.name=x ${action}`,
+  (action) => `git --no-pager -C ${repo} ${action}`,
+  (action) => `git --work-tree="${insideSpace}" ${action}`,
+  (action) => `GIT_DIR=${repo}/.git git ${action}`,
+  (action) => `cd "${insideSpace}" && git ${action}`,
+  (action) => `cd sub && git ${action}`,
+  (action) => `ls; git ${action}`,
+  (action) => `false || git ${action}`,
+  (action) => `ls\ngit ${action}`,
+  (action) => `(git ${action})`,
+  (action) => `{ git ${action}; }`,
+  (action) => `if git ${action}; then :; fi`,
+  (action) => `out="$(git ${action})"`,
+  (action) => `echo \`git ${action}\``,
+  (action) => `bash -lc 'git ${action}'`,
+  (action) => `eval 'git ${action}'`,
+  (action) => `bash <<'EOF'\ngit ${action}\nEOF`,
+  (action) => `FOO=1 git ${action}`,
+  (action) => `env FOO=1 git ${action}`,
+  (action) => `sudo -u bob git ${action}`,
+  (action) => `nohup git ${action} &`,
+  (action) => `command git ${action}`,
+  (action) => `timeout 60 git ${action}`,
+  (action) => `\\git ${action}`,
+  (action) => `/usr/bin/git ${action}`,
+  (action) => `git -C "$REPO" ${action}`,
+  (action) => `cd "$(mktemp -d)" && git ${action}`,
+];
+for (const action of writeActions) {
+  for (const form of writeForms) {
+    const command = form(action);
+    await test(`commit guard denies: ${JSON.stringify(command)}`, async () => {
+      const result = await E.bash(command);
+      assert.match(result.deny ?? '', /идёт ревью/, command);
+      assert.ok(result.deny.includes(id), 'the denial names the guarded session');
+      assert.equal(result.result, undefined, 'a denied call never reaches the core');
+    });
+  }
+}
+
+const allowedCommands = [
+  "rg 'git commit' docs", 'grep -rn "git push" .', 'echo git commit', 'echo "it\'s git stash"',
+  "FOO='git commit' ls", 'ls # git commit', '# git push\nls',
+  "cat <<'EOF' > notes.md\ngit commit -m x\nEOF",
+  'git status', 'git log --grep commit', 'git diff -- commit.txt', 'git show HEAD:push.md',
+  'git stash list', 'git stash show', 'git config alias.ci commit',
+  ...writeActions.flatMap((action) => [
+    `git -C "${outsideSpace}" ${action}`,
+    `git -C ${elsewhere} ${action}`,
+    `cd "${outsideSpace}" && git ${action}`,
+    `(cd ${elsewhere} && git ${action})`,
+  ]),
+];
+for (const command of allowedCommands) {
+  await test(`commit guard allows: ${JSON.stringify(command)}`, async () => {
+    assert.equal((await E.bash(command)).result, 'core reached', command);
+  });
+}
+for (const action of ['stash push -m wip', 'stash pop']) {
+  await test(`commit guard denies: git ${action}`, async () => {
+    assert.match((await E.bash(`git ${action}`)).deny ?? '', /идёт ревью/);
+  });
+}
+
+for (const [name, prefix] of [
+  ['assignments', '; x=1'.repeat(12_000)],
+  ['newlines', '\n'.repeat(60_000)],
+  ['arguments', '-a '.repeat(20_000)],
+]) {
+  await test(`commit guard: 60 KB of ${name} is decided in under a second`, async () => {
+    assert.equal(prefix.length, 60_000, 'the performance input is a full 60 KB');
+    for (const [command, denied] of [[prefix, false], [`${prefix}; git push`, true]]) {
+      const start = performance.now();
+      const result = await E.bash(command);
+      const elapsed = performance.now() - start;
+      assert.ok(elapsed < 1000, `${name}: ${elapsed.toFixed(1)} ms`);
+      assert.equal(Boolean(result.deny), denied);
+      console.log(`  ${name}${denied ? ' with write' : ''}: ${elapsed.toFixed(1)} ms`);
+    }
+  });
+}
+
+const deepForms = [
+  ['substitutions', (program) => '$('.repeat(20_000) + program + ')'.repeat(20_000)],
+  ['subshells', (program) => '('.repeat(50_000) + program + ')'.repeat(50_000)],
+];
+for (const [name, form] of deepForms) {
+  await test(`commit guard: deeply nested ${name} with git are denied without throwing`, async () => {
+    const result = await E.bash(form('git commit'));
+    assert.match(result.deny ?? '', /идёт ревью/);
+    assert.ok(result.deny.includes(id), 'the fallback names the first guarded session');
+    assert.equal(result.result, undefined);
+  });
+  await test(`commit guard: deeply nested ${name} without the word git reach core`, async () => {
+    for (const program of ['pwd', 'echo legitimate']) {
+      assert.equal((await E.bash(form(program))).result, 'core reached');
+    }
+  });
+}
+
+await test('commit guard: every write passes when no session is guarded', async () => {
+  const emptyHome = path.join(tmp, 'unguarded');
+  fs.mkdirSync(emptyHome);
+  const unguarded = await boot(compiled, {
+    cwd: repo, env: { HOME: os.homedir(), CODEX_DUET_HOME: emptyHome },
+  });
+  await unguarded.tick();
+  for (const action of writeActions) {
+    for (const form of writeForms) {
+      assert.equal((await unguarded.bash(form(action))).result, 'core reached', form(action));
+    }
+  }
+  for (const [, form] of deepForms) {
+    for (const program of ['git commit', 'pwd', 'echo legitimate']) {
+      assert.equal((await unguarded.bash(form(program))).result, 'core reached');
+    }
+  }
+});
+
+const parserDir = path.join(tmp, 'shell-unit');
+fs.mkdirSync(parserDir);
+const { gitWrites } = await import(pathToFileURL(compile(path.join(HERE, '..', 'hooks', 'shell.ts'), parserDir)).href);
+const parserCases = [
+  ['git -C a -C "../b c" push', [['push', '/review/b c']]],
+  ['git -C ~/project commit', [['commit', '/home/me/project']]],
+  ["git -C '~/project' push", [['push', '/review/~/project']]],
+  ['git -C \\~/project push', [['push', '/review/~/project']]],
+  ['git -C ~"/project" push', [['push', '/review/~/project']]],
+  ['git --work-tree=~/project push', [['push', '/review/~/project']]],
+  ['git -C ~/"a b" push', [['push', '/home/me/a b']]],
+  ["GIT_WORK_TREE='~/project' git push", [['push', '/review/~/project']]],
+  ['GIT_WORK_TREE=~/project git push', [['push', '/home/me/project']]],
+  ['git -C ~someone/project push', [['push', null]]],
+  ['git -C ../review-other push', [['push', '/review-other']]],
+  ['git --git-dir=/review/.git push', [['push', '/review']]],
+  ['git --git-dir /review/admin push', [['push', '/review/admin']]],
+  ['git -C sub --git-dir ../.git push', [['push', '/review']]],
+  ['git --work-tree "a b" --git-dir /other/.git commit', [['commit', '/review/a b']]],
+  ['git --work-tree sub -C /elsewhere push', [['push', '/elsewhere/sub']]],
+  ['GIT_WORK_TREE="a b" GIT_DIR=/other/.git git push', [['push', '/review/a b']]],
+  ['GIT_DIR=/other/.git git --work-tree . push', [['push', '/review']]],
+  ['GIT_WORK_TREE=/elsewhere git --work-tree /review push', [['push', '/review']]],
+  ['git --namespace ns --exec-path=/tools -P --bare --no-replace-objects --literal-pathspecs push', [['push', '/review']]],
+  ['git --namespace=ns --exec-path --paginate -p --no-optional-locks -c x=y push', [['push', '/review']]],
+  ['git -c alias.x=commit x', []],
+  ['cd "a b"; git commit; cd ../sub && git push', [['commit', '/review/a b'], ['push', '/review/sub']]],
+  ['pushd sub; git push; popd; git commit', [['push', '/review/sub'], ['commit', '/review']]],
+  ['pushd /elsewhere; pushd; git push', [['push', '/review']]],
+  ['pushd -n /elsewhere; git push; popd; git commit', [['push', '/review'], ['commit', '/elsewhere']]],
+  ['(cd /elsewhere && git push); git commit', [['push', '/elsewhere'], ['commit', '/review']]],
+  ['{ cd sub; }; git push', [['push', '/review/sub']]],
+  ['out="$(cd /elsewhere && git push)"; git commit', [['push', '/elsewhere'], ['commit', '/review']]],
+  ['bash -c "cd /elsewhere; git push"; git commit', [['push', '/elsewhere'], ['commit', '/review']]],
+  ['eval \'cd sub\'; git push', [['push', '/review/sub']]],
+  ['GIT_WORK_TREE=/elsewhere eval "git push"', [['push', '/elsewhere']]],
+  ['GIT_WORK_TREE=/elsewhere eval "git push"; git commit', [['push', '/elsewhere'], ['commit', '/review']]],
+  ['cd /elsewhere || git push', [['push', '/review']]],
+  ['cd /elsewhere || :; git push', [['push', null]]],
+  ['cd /review || :; git push', [['push', '/review']]],
+  ['eval "GIT_WORK_TREE=/elsewhere"; git push', [['push', '/elsewhere']]],
+  ['cd "$DIR"; git commit; git -C /known push', [['commit', null], ['push', '/known']]],
+  ['git -C "a*" push; git --work-tree "$DIR" commit; GIT_DIR="`pwd`" git stash', [['push', null], ['commit', null], ['stash', null]]],
+  ['echo git#commit; echo "$(git push)"; echo \'$(git commit)\'', [['push', '/review']]],
+  ['echo { git push }', []],
+  ["'FOO=1' git push; F'OO'=1 git commit", []],
+  ["FOO='git push' git commit", [['commit', '/review']]],
+  ["env 'GIT_WORK_TREE=/elsewhere' git push", [['push', '/elsewhere']]],
+  ['command FOO=1 git push', []],
+  ['FOO=1 command git push; time FOO=1 git commit', [['push', '/review'], ['commit', '/review']]],
+  ['echo } git push', []],
+  ['echo ${x:-\'$(git push)\'}', []],
+  ['echo "${x:-"a; git push "}"', []],
+  ['echo "${x:-\'$(git push)\'}"', [['push', '/review']]],
+  ['echo "\\$(git push)"', []],
+  ['echo \'git push\'; echo $\'git commit\\\' mention\'; git status', []],
+  ['echo $\'a\\\'b\'; git push', [['push', '/review']]],
+  ['git push 2>/tmp/output; >out git commit', [['push', '/review'], ['commit', '/review']]],
+  ['echo x >"$(git push)"', [['push', '/review']]],
+  ['cat <<EOF && git push\ngit commit\nEOF', [['push', '/review']]],
+  ['cat <<EOF\n$(git push)\nEOF', [['push', '/review']]],
+  ["cat <<'EOF'\n$(git push)\nEOF", []],
+  ['bash <<EOF\ncd /elsewhere\n$(git push)\nEOF', [['push', '/review']]],
+  ['bash <<EOF\ncd /elsewhere\n\\$(git push)\nEOF', [['push', '/elsewhere']]],
+  ['cat <<-EOF\n\tgit push\n\tEOF\ngit commit', [['commit', '/review']]],
+  ['bash <<-"EOF"\n\tcd sub; git push\n\tEOF', [['push', '/review/sub']]],
+  ['cat <<FIRST; bash <<SECOND\ngit commit\nFIRST\ngit push\nSECOND', [['push', '/review']]],
+  ['bash <<EOF | cat\ngit push\nEOF', [['push', '/review']]],
+  ["cat <<'EOF' | bash\ngit push\nEOF", [['push', '/review']]],
+  ["(bash) <<'EOF'\ngit push\nEOF", [['push', '/review']]],
+  ["cat <<'EOF' | cat | (sh)\ngit push\nEOF", [['push', '/review']]],
+  ["cat <<'EOF' >/tmp/notes | bash\ngit push\nEOF", []],
+  ["cat file.txt <<'EOF' | bash\ngit push\nEOF", []],
+  ["out=\"$(cat <<'EOF'\ngit commit\nEOF\n)\"", []],
+  ['eval \'bash -c "git push"\'', [['push', '/review']]],
+  ['bash -lc \'eval "git push"\'', [['push', '/review']]],
+  ['echo "$(echo $(git push))"', [['push', '/review']]],
+  ['echo "`git push`"', [['push', '/review']]],
+  ['echo `echo \\`git push\\``', [['push', '/review']]],
+  ['if :; then git push; elif git commit; then :; else git stash; fi', [['push', '/review'], ['commit', '/review'], ['stash', '/review']]],
+  ['while git push; do :; done; until git stash; do :; done; ! git commit', [['push', '/review'], ['stash', '/review'], ['commit', '/review']]],
+  ['cd /elsewhere | cat; git push', [['push', '/review']]],
+  ['echo x | cd /elsewhere; git push', [['push', '/review']]],
+  ['cd /elsewhere |\ncat; git push', [['push', '/review']]],
+  ['cd /elsewhere && git push & git commit', [['push', '/elsewhere'], ['commit', '/review']]],
+  ['cd /elsewhere &&\ngit push & git commit', [['push', '/elsewhere'], ['commit', '/review']]],
+  ['GIT_DIR=/elsewhere/.git; env --unset=GIT_DIR git push', [['push', '/review']]],
+  ['env --ignore-environment -u GIT_DIR -C /review/sub git push', [['push', '/review/sub']]],
+  ['env -C /elsewhere bash -c "git push"', [['push', '/elsewhere']]],
+  ['sudo --user bob --group staff -- git push', [['push', '/review']]],
+  ['sudo -nu bob git push', [['push', '/review']]],
+  ['GIT_DIR=/elsewhere/.git; env -uGIT_DIR git push', [['push', '/review']]],
+  ['env -iC/elsewhere git push', [['push', '/elsewhere']]],
+  ['xargs -tI {} git push', [['push', '/review']]],
+  ['command -pv git commit; command -pV git push', []],
+  ['sudo -D /elsewhere -u bob git push', [['push', '/elsewhere']]],
+  ['time -o /tmp/timing git push', [['push', '/review']]],
+  ['nice -n 10 timeout --signal TERM --kill-after=2 60 xargs -n 1 -I {} git push', [['push', '/review']]],
+  ['command -v git commit; command -V git push', []],
+  ['builtin git push; exec -a git-process git commit; time -p git stash', [['push', '/review'], ['commit', '/review'], ['stash', '/review']]],
+  ["bash -s -- arg <<'EOF'\ngit push\nEOF", [['push', '/review']]],
+  ["bash 3<<'EOF'\ngit push\nEOF", []],
+  ["bash <<'EOF' </dev/null\ngit push\nEOF", []],
+  ["bash release.sh <<'EOF'\ngit push\nEOF", []],
+  ["bash <<'EOF'\n(cd /elsewhere; git push)\ngit commit\nEOF", [['push', '/elsewhere'], ['commit', '/review']]],
+  ['git --work-tree', []], ['xargs -n', []], ['sudo -u', []],
+  ['echo {git,stash}; echo git\\ push; echo "git; push"', []],
+];
+for (const [command, expected] of parserCases) {
+  await test(`shell parser: ${JSON.stringify(command)}`, () => {
+    assert.deepEqual(gitWrites(command, '/review', '/home/me').map((write) => [write.action, write.cwd]), expected);
+  });
+}
+
+const extraHookCases = [
+  ...writeActions.flatMap((action) => [
+    [`git --git-dir="${repo}/.git" --work-tree="${outsideSpace}" ${action}`, true],
+    [`git --work-tree="${outsideSpace}" --git-dir="${repo}/.git" ${action}`, true],
+  ]),
+  [`GIT_DIR="${repo}/.git" GIT_WORK_TREE="${outsideSpace}" git push`, true],
+  [`GIT_WORK_TREE="${outsideSpace}" GIT_DIR="${repo}/.git" git push`, true],
+  [`git -C sub --git-dir=../.git --work-tree="${outsideSpace}" commit -m x`, true],
+  [`git --git-dir="$REPO/.git" --work-tree="${outsideSpace}" push`, true],
+  [`git --git-dir="${elsewhere}/.git" --work-tree="${outsideSpace}" push`, false],
+  [`git --git-dir="${repo}/.git" --work-tree="${outsideSpace}" stash list`, false],
+  [`git --git-dir="${repo}/.git" --work-tree="${outsideSpace}" stash show`, false],
+  ['git --git-dir .git push', true],
+  [`GIT_WORK_TREE="${insideSpace}" git commit`, true],
+  [`git --git-dir="${elsewhere}/.git" --work-tree "${insideSpace}" push`, true],
+  [`git -C "${outsideSpace}" --work-tree "${insideSpace}" push`, true],
+  ['builtin git commit', true], ['exec git push', true], ['nice -n 10 git push', true],
+  ['xargs -n 1 git push', true], ['time -p git commit', true], ['ls | git push', true],
+  ['while git push; do :; done', true], ['until git stash; do :; done', true], ['! git commit', true],
+  ['git -C a* push', true], ['git -C `pwd` push', true],
+  [`(cd "${outsideSpace}" && git status); git push`, true],
+  [`out="$(cd "${outsideSpace}" && git status)"; git push`, true],
+  [`cd "${outsideSpace}" && git status & git push`, true],
+  ['bash -ic \'eval "git push"\'', true],
+  ['cat <<EOF\n$(git push)\nEOF', true],
+  ['bash <<-"EOF"\n\tgit push\n\tEOF', true],
+  ['cat <<EOF\ngit push\nEOF', false], ['cat <<"EOF"\ngit push\nEOF', false],
+  ["echo $'git commit\\\' is a mention'", false],
+  ['echo "\\$(git push)"', false], ['echo git#push', false],
+  [`GIT_WORK_TREE="${outsideSpace}" git push`, false],
+  [`git --git-dir="${elsewhere}/.git" push`, false],
+  [`git --work-tree="${outsideSpace}" push`, false],
+  [`cd "${outsideSpace}" && git status; git push`, false],
+  [`git -C "${insideSpace}/../../elsewhere" push`, false],
+  [`git -C "${repo}-other" push`, false],
+  ["git -C '~/project' push", true], ['git -C \\~/project push', true],
+  ['echo { git push }', false], ['echo } git push', false],
+  ['echo ${x:-\'$(git push)\'}', false], ['echo "${x:-"a; git push "}"', false],
+  ["cat <<'EOF' | bash\ngit push\nEOF", true],
+  ["(bash) <<'EOF'\ngit push\nEOF", true],
+  [`cd "${outsideSpace}" || git push`, true],
+  [`cd "${outsideSpace}" && GIT_WORK_TREE="${insideSpace}" eval 'git push'`, true],
+  [`GIT_WORK_TREE="${outsideSpace}" eval 'git push'`, false],
+  ['sudo -nu bob git push', true], ['xargs -tI {} git push', true],
+  [`pushd "${outsideSpace}"; pushd; git push`, true],
+  ["'FOO=1' git push", false], ['command FOO=1 git push', false],
+  ...['bash', 'sh', 'zsh', 'dash', 'ksh'].flatMap((shell) => ['-c', '-lc', '-ic'].map((option) => [
+    `${shell} ${option} 'git push'`, true,
+  ])),
+];
+for (const [command, denied] of extraHookCases) {
+  await test(`commit guard ${denied ? 'denies' : 'allows'}: ${JSON.stringify(command)}`, async () => {
+    const result = await E.bash(command);
+    assert.equal(Boolean(result.deny), denied, command);
+    assert.equal(result.result, denied ? undefined : 'core reached');
+  });
+}
+
+for (const [command, dirs] of [
+  ['git --git-dir=/review/.git --work-tree=/elsewhere commit', ['/elsewhere', '/review']],
+  ['git --work-tree=/elsewhere --git-dir=/review/.git commit', ['/elsewhere', '/review']],
+  ['GIT_DIR=/review/.git GIT_WORK_TREE=/elsewhere git push', ['/elsewhere', '/review']],
+  ['git -C sub --git-dir=../.git --work-tree=../../elsewhere push', ['/elsewhere', '/review']],
+  ['git --git-dir=$REPO/.git --work-tree=/elsewhere push', ['/elsewhere', null]],
+  ['git --git-dir=/review/.git push', ['/review']],
+]) {
+  await test(`shell parser reports every affected directory: ${JSON.stringify(command)}`, () => {
+    assert.deepEqual(gitWrites(command, '/review', '/home/me').map((write) => write.dirs), [dirs]);
+  });
+}
 
 await test("context note: on the person's own messages in the Claude session that drives the review", async () => {
   const typed = await E.prompt('как дела?');

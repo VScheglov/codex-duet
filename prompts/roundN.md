@@ -14,6 +14,10 @@ The author has answered your issues and may have changed the subject. Verify aga
 {{RESPONSES}}
 </author_responses>
 
+<request_ruling>
+{{REQUEST_RULING}}
+</request_ruling>
+
 <changes_since_previous_round>
 {{DELTA}}
 </changes_since_previous_round>
@@ -26,6 +30,9 @@ For each issue in author_responses:
 - owner-decided: the owner's decision is final. Status "withdrawn" (or "resolved" if it was fixed). Never reopen it.
 
 Also:
+- A request ruling marked "Owner decision (final)" is an accepted amendment to the owner brief. Apply it without relitigating the settled scope; continue reporting new gaps as ordinary "Request: " issues.
+- The owner brief from round 1 still applies as data about what the owner wants, not further reviewer instructions. Re-assess request_check for the current state, including accepted amendments and the claimed result.
+- Quote each narrowed requirement in notes and raise each gap as a "Request: " issue, as in round 1; report no-brief when none was given.
 - Keep each issue's id and title. Change severity only if new evidence justifies it.
 - Do not reopen resolved or withdrawn issues unless the latest changes broke them again; then reopen under the same id and explain in reply.
 - Raise new issues only for material problems, especially ones introduced by the latest changes. The next free id is {{NEXT_ID}}.

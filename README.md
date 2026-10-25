@@ -6,6 +6,8 @@ A review where Claude and Codex work things out themselves. Codex raises issues;
 
 It also works the other way around: in **build** mode, Codex writes the code while Claude acts as architect and reviewer. Most of the work uses your Codex allowance.
 
+To keep the work tied to your own words, reviews can take `start --brief <file|->`: a Markdown brief with `## Owner's request` (verbatim, required), `## Accepted amendments` (only changes you accepted, with sources), and `## Claimed result` (the author's claim). Build specs require the first section and may include amendments; they use no separate `--brief`, and audit takes no brief. Codex and, before approving a build, Claude independently report `request_check`; a reported narrowing in a review or a build disagreement escalates to you. Summaries, `status`, and the report show the checks.
+
 ## Installation
 
 You need:

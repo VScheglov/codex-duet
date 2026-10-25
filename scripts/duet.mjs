@@ -40,12 +40,14 @@ const PHASE_BY_ACTION = { continue: 'awaiting-author', done: 'done', escalate: '
 const USAGE = `Usage: duet.mjs <command> [options]
 
   start   --kind plan|code|file [--subject <path>|-]... [--base <ref>] [--focus <text>]
+          [--brief <file>|-]  owner's request, accepted amendments and claimed result
           [--max-rounds 10] [--model <name>] [--effort <level>] [--timeout-min 0]
           (--timeout-min: minutes per Codex turn; 0, the default, is no limit)
           [--sandbox inherit|read-only|workspace-write|danger-full-access]
           (inherit, the default: whatever the owner's Codex config allows)
   start   --kind build --subject <spec>|- [--base <ref>] [--branch <name>] [...the options above]
           Codex implements the spec in a worktree on a new branch; Claude reviews
+          The spec needs a non-empty ## Owner's request section; --brief is for reviews only
   start   --kind audit --subject <task>|- [--model <name>] [--effort <level>] [--timeout-min 0]
           Codex examines what the task asks about in the current directory, always read-only, and
           reports findings with evidence: one turn, nothing to answer, the report is the result
@@ -237,6 +239,36 @@ function readStdin() {
       reject(err);
     });
   });
+}
+
+// Markdown headings inside fenced examples are data, not sections. A request section ends
+// at the next level-1 or level-2 heading; subsections still belong to the request.
+function hasOwnerRequest(text) {
+  let inRequest = false;
+  let content = [];
+  let fence = null;
+  const nonEmpty = () => content.some((line) => line.replace(/^[ \t]*(?:>[ \t]*)+/, '').trim());
+  for (const line of text.split(/\r?\n/)) {
+    if (fence) {
+      if (new RegExp(`^[ \\t]*${fence[0]}{${fence.length},}[ \\t]*$`).test(line)) fence = null;
+      if (inRequest) content.push(line);
+      continue;
+    }
+    const opening = /^[ \t]*(`{3,}|~{3,})/.exec(line);
+    if (opening) {
+      fence = opening[1];
+      if (inRequest) content.push(line);
+      continue;
+    }
+    const heading = /^[ \t]*(#{1,6})(?:[ \t]+(.*)|[ \t]*)$/.exec(line);
+    if (heading && heading[1].length <= 2) {
+      if (inRequest && nonEmpty()) return true;
+      const title = (heading[2] || '').replace(/[ \t]+#+[ \t]*$/, '').trim().toLowerCase().replace(/[\u2019\u02bc]/g, "'");
+      inRequest = heading[1].length === 2 && title === "owner's request";
+      content = [];
+    } else if (inRequest) content.push(line);
+  }
+  return inRequest && nonEmpty();
 }
 
 // ---------------------------------------------------------------- state
@@ -629,6 +661,7 @@ function buildPrompt(st, round, snap, prev, payload) {
       TOOLING: toolingNote(st),
       KIND_GUIDANCE: template(`kind-${st.kind}.md`).trim(),
       FOCUS: st.focus || '(none: review everything material)',
+      OWNER_BRIEF: st.brief ? fs.readFileSync(st.brief, 'utf8').replace(/\n?$/, '\n') : '(none given)\n',
       SUBJECT_BODY: subject.body,
     });
   }
@@ -644,6 +677,7 @@ function buildPrompt(st, round, snap, prev, payload) {
     DELTA: subject.delta,
     NEXT_ID: nextId(st),
     SUBJECT_BODY: subject.body,
+    REQUEST_RULING: requestRulingLine(st),
   });
 }
 
@@ -872,6 +906,32 @@ function stderrTail(file, lines = 15) {
   }
 }
 
+function validRequestCheck(value, allowNoBrief = true) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && ['matches', 'narrowed', 'unclear', ...(allowNoBrief ? ['no-brief'] : [])].includes(value.status)
+    && typeof value.notes === 'string';
+}
+
+function normalizeRequestCheck(value, allowNoBrief = true) {
+  return validRequestCheck(value, allowNoBrief)
+    ? { status: value.status, notes: value.notes.trim() }
+    : { status: 'unclear', notes: '(not reported)' };
+}
+
+function validOwnerRequestCheck(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) && value.owner === true
+    && ['matches', 'narrowed-accepted'].includes(value.status)
+    && typeof value.notes === 'string' && value.notes.trim().length > 0;
+}
+
+// Only Claude's review command may relay this flag; Codex checks still use
+// normalizeRequestCheck, which cannot grant an owner ruling or its extra status.
+function normalizeBuildReviewCheck(value) {
+  return validOwnerRequestCheck(value)
+    ? { status: value.status, notes: value.notes.trim(), owner: true }
+    : normalizeRequestCheck(value, false);
+}
+
 function normalizeReply(raw) {
   if (!raw || typeof raw !== 'object') throw new Error('not a JSON object');
   if (!['approve', 'revise'].includes(raw.verdict)) throw new Error(`bad verdict: ${raw.verdict}`);
@@ -896,14 +956,29 @@ function normalizeReply(raw) {
       owner: it.owner === true, // build mode: the reviewer relays the owner's final ruling
     });
   }
-  return { verdict: raw.verdict, summary: String(raw.summary || '').trim(), issues: [...issues.values()] };
+  return {
+    verdict: raw.verdict,
+    summary: String(raw.summary || '').trim(),
+    issues: [...issues.values()],
+    request_check: normalizeRequestCheck(raw.request_check),
+  };
 }
 
 // ---------------------------------------------------------------- ledger
 
+function recordRequestRuling(st, { status, notes }) {
+  st.requestRuling = { status, notes: notes.trim(), round: st.round };
+  const last = st.rounds.at(-1);
+  if (last) last.request_ruling = st.requestRuling;
+}
+
 function applyResponses(st, payload) {
   if (!payload || typeof payload !== 'object' || !Array.isArray(payload.responses)) {
     throw new UsageError('responses must look like {"changes": "...", "responses": [{"id", "action", "note"}]}');
+  }
+  if (Object.hasOwn(payload, 'request_ruling')
+    && (typeof payload.request_ruling !== 'string' || !payload.request_ruling.trim())) {
+    throw new UsageError('request_ruling must be a non-empty string conveying the owner\'s decision');
   }
   const seen = new Set();
   for (const r of payload.responses) {
@@ -922,6 +997,9 @@ function applyResponses(st, payload) {
     .filter((i) => i.status === 'open' && !i.parked && !seen.has(i.id))
     .map((i) => i.id);
   if (missing.length) throw new UsageError(`answer every open issue; missing: ${missing.join(', ')}`);
+  if (Object.hasOwn(payload, 'request_ruling')) {
+    recordRequestRuling(st, { notes: payload.request_ruling });
+  }
   for (const r of payload.responses) {
     const issue = st.issues[r.id];
     issue.author = { action: r.action, note: r.note, round: st.round };
@@ -1059,6 +1137,17 @@ async function decide(st, reply) {
   if (d.action === 'escalate' && !view.open.length && !view.parked.length) {
     d = { action: 'done', reason: `nothing is left for the owner to decide (policy: ${d.reason})`, issues: [], enforced: true };
   }
+  // Apply request checks last: a policy conversion to DONE must not erase a narrowing.
+  if (d.action === 'done' && !st.requestRuling) {
+    const last = st.rounds.at(-1);
+    if (st.kind !== 'build' && normalizeRequestCheck(last?.request_check).status === 'narrowed') {
+      d = { action: 'escalate', reason: "the reviewer reports the subject narrows the owner's request", issues: [], enforced: true };
+    } else if (st.kind === 'build' && reply.verdict === 'approve'
+      && normalizeRequestCheck(last?.request_check, false).status === 'matches'
+      && ['narrowed', 'unclear'].includes(normalizeRequestCheck(last?.author?.request_check, false).status)) {
+      d = { action: 'escalate', reason: "Codex and Claude disagree on whether the work delivers the owner's request", issues: [], enforced: true };
+    }
+  }
   if (d.action === 'escalate' && !d.issues.length) d.issues = [...view.open, ...view.parked].map((i) => i.id);
   return d;
 }
@@ -1139,6 +1228,7 @@ async function runRound(st, round, payload) {
     n: round,
     verdict: reply.verdict,
     summary: reply.summary,
+    request_check: reply.request_check,
     snapshot: snap,
     startedAt,
     finishedAt: now(),
@@ -1188,8 +1278,9 @@ async function initBuildSubject(st, o, dir) {
   const base = git(['rev-parse', '--verify', '-q', `${o.base || 'HEAD'}^{commit}`], { cwd: repo, allowFail: true });
   if (base.status !== 0) throw new UsageError(o.base ? `unknown --base: ${o.base}` : '--kind build needs a commit to branch from');
   const spec = o.subject[0] === '-' ? await readStdin() : fs.readFileSync(path.resolve(st.cwd, o.subject[0]), 'utf8');
-  if (!spec.trim()) throw new UsageError('the specification is empty');
+  if (!hasOwnerRequest(spec)) throw new UsageError("add a non-empty `## Owner's request` section (ASCII apostrophe) to the specification, quoting the owner's own words");
   fs.writeFileSync(path.join(dir, 'spec.md'), spec);
+  st.brief = path.join(dir, 'spec.md');
   const branch = checkToken(o.branch, 'branch', /^[\w./-]+$/) ?? `codex-duet/${st.id}`;
   const worktree = path.join(dir, 'worktree');
   const added = git(['worktree', 'add', '-q', '-b', branch, worktree, base.stdout.trim()], { cwd: repo, allowFail: true });
@@ -1228,6 +1319,7 @@ function normalizeAuthorReply(raw) {
     tests: String(raw.tests || '').trim() || '(not reported)',
     responses: [...responses.values()],
     questions: (Array.isArray(raw.questions) ? raw.questions : []).map((q) => String(q).trim()).filter(Boolean),
+    request_check: normalizeRequestCheck(raw.request_check, false),
   };
 }
 
@@ -1276,6 +1368,7 @@ async function runBuildTurn(st, round, review) {
         VERDICT: review.verdict,
         SUMMARY: review.summary || '(no summary)',
         ISSUES: issuesForAuthor(st),
+        REQUEST_RULING: requestRulingLine(st),
       });
   const release = await takeSlot(st, round, { review, threadId: cutOff ?? undefined });
   const startedAt = now();
@@ -1305,7 +1398,7 @@ async function runBuildTurn(st, round, review) {
   st.round = round;
   st.rounds.push({
     n: round,
-    author: { summary: reply.summary, tests: reply.tests, questions: reply.questions },
+    author: { summary: reply.summary, tests: reply.tests, questions: reply.questions, request_check: reply.request_check },
     snapshot: takeSnapshot(st, round),
     startedAt,
     finishedAt: now(),
@@ -1329,6 +1422,7 @@ function renderBuildSummary(st) {
     `## codex-duet ${st.id} · build · round ${st.round}/${st.maxRounds} (${duration(last.startedAt, last.finishedAt)})`,
     `Worktree: ${worktree} (branch ${branch})`,
     modelLine(st),
+    ...requestCheckLines(st),
   ];
   if (st.phase === 'awaiting-review') {
     L.push(`Codex: ${indent(last.author.summary)}`, `Tests: ${indent(last.author.tests)}`);
@@ -1354,10 +1448,12 @@ function renderBuildSummary(st) {
       diff.length > REVIEW_DIFF_LIMIT ? `${diff.slice(0, REVIEW_DIFF_LIMIT)}\n... (truncated: inspect the rest per file with the command above)` : (diff.trim() || '(no changes)'),
       '```',
       '',
-      'Next: review (read files in the worktree where needed, run the tests there), then run:',
+      "Next: review (read files in the worktree where needed, run the tests there), independently check the owner's request and accepted amendments in the spec, then run:",
+      'Approval requires request_check; if narrowed, raise an issue for each gap instead of approving.',
       '```bash',
       `node "${SELF}" review --session ${st.id} --issues - <<'DUET_JSON'`,
-      '{"verdict": "approve|revise", "summary": "<one or two sentences>", "issues": [',
+      '{"verdict": "approve|revise", "summary": "<one or two sentences>",',
+      ' "request_check": {"status": "matches|narrowed|unclear", "notes": "<your independent check>"}, "issues": [',
       '  {"id": "C1", "status": "open|resolved|withdrawn", "severity": "critical|high|medium|low", "title": "…", "body": "…", '
         + '"location": "path:line", "recommendation": "…", "confidence": 0.8, "reply": "", "owner": false}',
       ']}',
@@ -1393,7 +1489,25 @@ async function cmdReview(o) {
   const raw = o.issues === '-' ? await readStdin() : fs.readFileSync(path.resolve(o.issues), 'utf8');
   let review;
   try {
-    review = normalizeReply(JSON.parse(raw));
+    const parsed = JSON.parse(raw);
+    const check = parsed?.request_check;
+    if (check?.owner != null && typeof check.owner !== 'boolean') throw new Error('request_check.owner must be a boolean');
+    if (check?.owner === true && !validOwnerRequestCheck(check)) {
+      throw new Error('an owner ruling in request_check needs status matches or narrowed-accepted and non-empty decision notes');
+    }
+    if (check?.status === 'narrowed-accepted' && check.owner !== true) {
+      throw new Error('request_check narrowed-accepted requires owner: true to relay an owner ruling');
+    }
+    if (parsed?.verdict === 'approve' && check?.owner !== true) {
+      if (!validRequestCheck(parsed.request_check, false)) {
+        throw new Error("approve requires a valid request_check: independently check the work against the owner's request and accepted amendments in the spec");
+      }
+      if (parsed.request_check.status === 'narrowed') {
+        throw new Error('approve with request_check narrowed is refused: raise an issue for each gap instead');
+      }
+    }
+    review = normalizeReply(parsed);
+    review.request_check = normalizeBuildReviewCheck(check);
   } catch (err) {
     throw new UsageError(`the review is not valid: ${err.message}`);
   }
@@ -1406,10 +1520,12 @@ async function cmdReview(o) {
     if (!['awaiting-review', 'escalated', 'done'].includes(st.phase)) throw new UsageError(`nothing to review now (phase: ${st.phase})`);
     switchCodex(st, o);
     if (o['max-rounds']) st.maxRounds = toInt(o['max-rounds'], 'max-rounds');
+    if (review.request_check.owner === true) recordRequestRuling(st, review.request_check);
     mergeReply(st, review, st.round);
     Object.assign(st.rounds.at(-1), {
       verdict: review.verdict,
       summary: review.summary,
+      request_check: review.request_check,
       open: openIssues(st).length,
       parked: parkedIssues(st).length,
     });
@@ -1695,6 +1811,30 @@ function renderPositions(issue) {
   ];
 }
 
+const requestCheckText = (check) => `${check.status} — ${oneLine(check.notes)}`;
+const requestRulingLine = (st) => st.requestRuling
+  ? `Owner decision (final): ${st.requestRuling.status ? `${st.requestRuling.status} — ` : ''}${oneLine(st.requestRuling.notes)}`
+  : '(none recorded)';
+
+function codexRequestCheck(st) {
+  const last = st.rounds.at(-1);
+  return normalizeRequestCheck(st.kind === 'build' ? last?.author?.request_check : last?.request_check, st.kind !== 'build');
+}
+
+function requestCheckLines(st) {
+  const L = st.kind !== 'build' && !st.brief ? ['Owner brief: none'] : [];
+  L.push(`Owner's request: ${requestCheckText(codexRequestCheck(st))}`);
+  if (st.kind === 'build') {
+    const reviewed = st.rounds.findLast((r) => r.verdict);
+    if (reviewed) {
+      const earlier = reviewed.n !== st.round ? `, round ${reviewed.n}` : '';
+      L.push(`Owner's request (Claude${earlier}): ${requestCheckText(normalizeBuildReviewCheck(reviewed.request_check))}`);
+    }
+  }
+  if (st.requestRuling) L.push(requestRulingLine(st));
+  return L;
+}
+
 function renderSummary(st) {
   const last = st.rounds.at(-1);
   const d = st.decision;
@@ -1706,6 +1846,7 @@ function renderSummary(st) {
     `Subject: ${subjectLine(st)}`,
     modelLine(st),
     `Codex verdict: ${last.verdict} — ${last.summary}`,
+    ...requestCheckLines(st),
     `Decision: ${d.action.toUpperCase()} — ${d.reason}${d.enforced ? ' (enforced by duet.mjs)' : ''}`,
   ];
   if (closedNow.length) {
@@ -1760,6 +1901,13 @@ function renderReport(st) {
     `- Rounds: ${st.round}/${st.maxRounds}`,
     `- Outcome: ${st.decision?.action ?? st.phase} — ${st.decision?.reason ?? ''}`,
     `- Codex thread: ${st.codex.threadId} (continue it in Codex: codex resume ${st.codex.threadId})`,
+    '',
+    "## Owner's request",
+    '',
+    `Owner brief: ${st.brief || 'none'}`,
+    `Codex: ${requestCheckText(codexRequestCheck(st))}`,
+    ...(st.kind === 'build' ? [`Claude: ${requestCheckText(normalizeBuildReviewCheck(st.rounds.findLast((r) => r.verdict)?.request_check))}`] : []),
+    ...(st.requestRuling ? [requestRulingLine(st)] : []),
     '',
     '| ID | Severity | Title | Outcome | Rounds |',
     '|---|---|---|---|---|',
@@ -1828,6 +1976,23 @@ function initCodeSubject(st, o) {
 
 async function cmdStart(o) {
   if (!KINDS.includes(o.kind)) throw new UsageError(`--kind must be one of: ${KINDS.join(', ')}`);
+  let brief = null;
+  if (o.brief != null) {
+    if (o.kind === 'audit') throw new UsageError('--brief is not used with --kind audit: nothing is negotiated');
+    if (o.kind === 'build') throw new UsageError("--brief is not used with --kind build: put ## Owner's request and optional ## Accepted amendments in the spec itself");
+    if (o.brief === '-' && o.subject.includes('-')) throw new UsageError('--brief - and --subject - cannot share stdin; pass one as a file');
+    if (o.brief === '-') brief = await readStdin();
+    else {
+      try {
+        const file = path.resolve(o.brief);
+        if (!fs.statSync(file).isFile()) throw new Error('not a file');
+        brief = fs.readFileSync(file, 'utf8');
+      } catch (err) {
+        throw new UsageError(`cannot read --brief ${o.brief}: ${err.message}`);
+      }
+    }
+    if (!hasOwnerRequest(brief)) throw new UsageError("the brief needs a non-empty `## Owner's request` section (ASCII apostrophe), quoting the owner's own words");
+  }
   if (o.kind === 'audit' && o.sandbox && o.sandbox !== 'read-only') {
     throw new UsageError('an audit runs read-only: Codex examines and reports, it changes nothing (leave --sandbox out)');
   }
@@ -1846,6 +2011,7 @@ async function cmdStart(o) {
     kind: o.kind,
     cwd: fs.realpathSync(process.cwd()),
     focus: String(o.focus || '').trim(),
+    brief: brief == null ? null : path.join(dir, 'brief.md'),
     createdAt: now(),
     updatedAt: now(),
     maxRounds,
@@ -1859,6 +2025,7 @@ async function cmdStart(o) {
   };
   const release = acquireLock(id);
   try {
+    if (brief != null) fs.writeFileSync(st.brief, brief);
     if (st.kind === 'code') initCodeSubject(st, o);
     else if (st.kind === 'build') await initBuildSubject(st, o, dir);
     else if (st.kind === 'audit') await initAuditSubject(st, o, dir);
@@ -1880,7 +2047,7 @@ async function cmdStart(o) {
 }
 
 const isOwnerDecisionsOnly = (payload) => Array.isArray(payload?.responses)
-  && payload.responses.length > 0
+  && (payload.responses.length > 0 || Object.hasOwn(payload, 'request_ruling'))
   && payload.responses.every((r) => r?.action === 'owner-decided');
 
 async function cmdReply(o) {
@@ -1904,7 +2071,7 @@ async function cmdReply(o) {
     if (st.round >= st.maxRounds) {
       if (!isOwnerDecisionsOnly(payload)) {
         throw new UsageError(`round limit reached (${st.round}/${st.maxRounds}); add --max-rounds <n> to allow more rounds `
-          + '(answers that are all owner-decided are recorded without a new round)');
+          + '(answers that are all owner-decided, or a request_ruling with no other answers, are recorded without a new round)');
       }
       await recordOwnerDecisions(st, payload);
       return;

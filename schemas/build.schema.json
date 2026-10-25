@@ -2,8 +2,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["summary", "tests", "responses", "questions"],
+  "required": ["summary", "tests", "responses", "questions", "request_check"],
   "properties": {
+    "request_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "notes"],
+      "properties": {
+        "status": { "type": "string", "enum": ["matches", "narrowed", "unclear"] },
+        "notes": { "type": "string", "description": "Round 1: compare the rest of the spec with the owner's request and accepted amendments before building. Later turns: re-check the current implementation. Quote every narrowed requirement and ask about each gap in questions; for unclear say why and what would settle it." }
+      }
+    },
     "summary": {
       "type": "string",
       "description": "What you changed in this turn and why, in a few sentences; say plainly what is not done yet."

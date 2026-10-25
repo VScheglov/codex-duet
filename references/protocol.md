@@ -21,6 +21,8 @@ DUET_JSON
 - `note` is mandatory and is what Codex sees. Make it verifiable: paths with lines, commands with their key output, quotes of requirements.
 - Write notes in the language of the issue text.
 
+Issues whose titles start with `Request: ` identify something dropped, narrowed or contradicted from the owner's request, accepted amendments or claimed result. Answer them like any other issue: fix, dispute with evidence, or park for the owner. A dispute must quote the owner's words (and the accepted amendment with its source when relevant) to show why the requirement is still met; the author's narrower specification alone is not evidence. Codex re-assesses `request_check` each round. Without an owner request ruling, a latest check of `narrowed` prevents `DONE` and escalates even if the reviewer otherwise approves; `unclear` is shown but does not itself block `DONE`.
+
 ## Actions
 
 | action | meaning | what Codex does next |
@@ -60,6 +62,14 @@ Use the user's language. For each issue:
 - Decide: …the concrete question…
 
 Recommend an option when one is clearly better, and say why.
+
+For a request-check escalation, present the reviewer's notes and the decision needed even when there are no issue IDs. If the owner accepts the narrower result or clarifies that the request is met, relay their decision in a structured field:
+
+```json
+{"changes": "Owner settled the scope.", "request_ruling": "The owner accepts CSV only for this release.", "responses": []}
+```
+
+`request_ruling` must be a non-empty string conveying the owner's actual decision. It is allowed before an escalation too, persists across later replies, and is shown in summaries, `status` and the report as `Owner decision (final)`. Every later Codex turn receives it as an accepted amendment. The request-check backstop no longer escalates after a ruling; new gaps still use ordinary `Request: ` issues, and every open issue still needs an answer. At the round limit, a ruling with only `owner-decided` responses (or no responses) is recorded without another Codex turn; add `--max-rounds` if another turn is wanted. If the owner requires the full scope instead, fix the subject and reply with the change.
 
 ## Recovery
 

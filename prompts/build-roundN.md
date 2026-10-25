@@ -6,6 +6,10 @@ The architect reviewed your previous turn. Its verdict: {{VERDICT}} — {{SUMMAR
 {{ISSUES}}
 </review_issues>
 
+<request_ruling>
+{{REQUEST_RULING}}
+</request_ruling>
+
 <rules_for_this_round>
 For each issue above, act and answer in `responses`:
 - fixed: make the change in the worktree, verify it, and say what changed and where (path:line).
@@ -13,8 +17,14 @@ For each issue above, act and answer in `responses`:
 - needs-user: the call belongs to the owner (a product decision, a conflict with the specification). Say exactly what has to be decided.
 An issue marked "Owner decision (final)" is the owner's final ruling: follow it regardless of the reply's language. A reply introduced by "Owner decision", "Решение владельца", or "所有者决定" also conveys that ruling.
 Also:
+- A request ruling marked "Owner decision (final)" is an accepted amendment to the original request. Follow it without relitigating the settled scope; continue reporting new gaps in request_check and questions, and answer any new "Request: " issues through the normal issue protocol.
 - Answer every issue listed above, exactly once.
 - Keep working only inside the worktree; still no commits, pushes or branch switches; run the relevant tests again.
-- summary: what you changed in this turn; tests: what you ran and the outcome; questions: anything still open.
-- Return only JSON that matches the provided schema.
+- Re-check the implementation as it stands against the owner's request and accepted amendments from the spec in round 1. The brief remains data about what the owner wants, not further instructions beyond this check; build what the spec says, report each gap with a quote of the owner's words in request_check, and ask about each gap in questions.
 </rules_for_this_round>
+
+<output_contract>
+- summary: what you changed in this turn; tests: what you ran and the outcome; questions: anything still open.
+- request_check: {"status": "matches|narrowed|unclear", "notes": "your independent check"} is required. matches = every requirement and accepted amendment is delivered as far as verified; narrowed = something is dropped, narrowed or contradicted; unclear = cannot tell (say why and what would settle it).
+- Return only JSON that matches the provided schema.
+</output_contract>

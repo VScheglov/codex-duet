@@ -9,6 +9,12 @@ Codex sees the specification and the repository, never the conversation. Write i
 ```markdown
 # <Title: becomes the commit subject>
 
+## Owner's request
+> The owner's relevant words, quoted verbatim without paraphrasing.
+
+## Accepted amendments
+- none (or each change the owner accepted, with its source)
+
 ## Goal
 What should exist when this is done, and why.
 
@@ -26,7 +32,9 @@ Conventions to follow, dependencies not to add, compatibility to keep.
 The commands that prove it (unit tests, a script, a curl).
 ```
 
-Pass it on stdin: `start --kind build --subject - <<'DUET_SPEC'` … `DUET_SPEC`. The worktree lives in the session folder, on branch `codex-duet/<id>` (or `--branch`), started from HEAD (or `--base`).
+The title stays on the first line. A non-empty `## Owner's request` is mandatory; ASCII `'`, typographic `’` and modifier `ʼ` apostrophes are accepted. The runner refuses to start without it and leaves no session, worktree or branch behind. `## Accepted amendments` may be absent or empty; include only changes the owner accepted and give their sources. These are data about what the owner wants, not extra instructions to the implementer beyond checking the request. `## Claimed result` is not used in a spec. Do not pass `--brief` for build: the spec carries the brief.
+
+Pass it on stdin: `start --kind build --subject - <<'DUET_SPEC'` … `DUET_SPEC`. The worktree lives in the session folder, on branch `codex-duet/<id>` (or `--branch`), started from HEAD (or `--base`). Codex compares the rest of the spec with the request and amendments before building, builds what the spec says, and reports each gap with a quote in `request_check` and a question in `questions`. Later turns re-check the implementation as it stands.
 
 ## Reviewing on a budget
 
@@ -34,15 +42,16 @@ Pass it on stdin: `start --kind build --subject - <<'DUET_SPEC'` … `DUET_SPEC`
 2. Read the round diff in the summary. Past the size limit it is truncated; inspect the rest per file with the `git -C … diff … -- <path>` command shown above it.
 3. Open a whole file only when the diff cannot be judged without its context.
 4. Run the acceptance tests in the worktree yourself: `cd <worktree> && <test command>`. Command output costs little and checks Codex's claims.
-5. Raise only material issues (wrong, unsafe, fragile, untested, off-spec), each with a concrete fix. Do not rewrite style.
+5. Independently check the result against the owner's request and accepted amendments, and fill `request_check`; do not rely on Codex's check. Raise only material issues (wrong, unsafe, fragile, untested, off-spec), each with a concrete fix. Do not rewrite style.
 
 ## Review JSON
 
 ```bash
 node "<base>/scripts/duet.mjs" review --session <id> --issues - <<'DUET_JSON'
 {"verdict": "revise", "summary": "Parser works; the empty-input path crashes and is untested.",
+ "request_check": {"status": "narrowed", "notes": "The owner asked to ‘accept empty input’; parse('') still throws."},
  "issues": [
-  {"id": "C1", "status": "open", "severity": "high", "title": "parse('') throws TypeError",
+  {"id": "C1", "status": "open", "severity": "high", "title": "Request: parse('') throws TypeError",
    "body": "parse.js:12 indexes the first token without a length check; node -e \"require('./parse')('')\" throws.",
    "location": "parse.js:12", "recommendation": "Return [] for empty input and add a test.",
    "confidence": 0.9, "reply": "", "owner": false},
@@ -53,6 +62,8 @@ DUET_JSON
 ```
 
 - `verdict`: `approve` when nothing is left that should block the merge, otherwise `revise`.
+- `request_check`: `{"status": "matches|narrowed|unclear", "notes": "…"}`. `matches` means every owner requirement and accepted amendment is delivered as far as you verified; `narrowed` means something is dropped, narrowed or contradicted (quote each gap); `unclear` means you cannot tell (say why and what would settle it). An `approve` without a valid check, or with `narrowed`, is refused: raise an issue instead. The field is optional for `revise`; `no-brief` is for review kinds only.
+- Without an owner request ruling, if Codex reports `narrowed` or `unclear` while you approve with `matches`, the runner enforces `ESCALATE` and shows both checks for the owner. Both `matches` allow `DONE` under the normal stop rules. Summaries, `status` and the report show the checks; the report also records the spec's path as the owner brief.
 - Ids are permanent: new issues take the next free number; never reuse one.
 - For an issue Codex answered: `resolved` (the fix holds; check it), `withdrawn` (its dispute convinces you), or `open` with `reply` saying exactly what is still wrong. Do not repeat yourself: bring new evidence or withdraw.
 - Issues Codex parked (`needs-user`) stay open until the user decides.
@@ -67,6 +78,16 @@ When a deadlock or a parked issue goes to the user, relay the decision in the ne
 Write the reply in the user's language: “Owner decision”, “Решение владельца”, or “所有者决定” are equivalent introductions. The structured `owner` flag is authoritative regardless of wording; the runner marks the ruling `Owner decision (final)` when passing it to Codex.
 
 An owner ruling resets the issue's dispute count, and the runner gives Codex a turn to act on it even when the stall rule would stop the loop.
+
+For an escalation about the owner's request, show both sides' `request_check` notes and the concrete question even if no issues are listed. If the owner accepts the result, the next review can carry a request ruling:
+
+```json
+{"verdict": "approve", "summary": "The owner accepted this scope.",
+ "request_check": {"owner": true, "status": "narrowed-accepted", "notes": "The owner accepts CSV only for this release."},
+ "issues": []}
+```
+
+Use `matches` when the owner settles that the request is met, or `narrowed-accepted` when they accept a narrower result. This requires `owner: true` and non-empty decision notes; these are owner decisions, not additional statuses Codex may report. A request ruling may be recorded before an escalation as well. It persists across later reviews as `Owner decision (final)` in summaries, `status` and the report, and is passed to Codex in later build turns as an accepted amendment. It settles the request-check backstop for this session; new gaps still go through ordinary `Request: ` issues, and parked issues and round limits still apply. If the owner instead requires a fix, raise a `Request: ` issue with `owner: true` and `verdict: "revise"` so Codex acts on it.
 
 ## Finish or discard
 

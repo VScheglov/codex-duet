@@ -34,7 +34,7 @@ const issue = (id, status, severity = 'high', extra = {}) => ({
   id, status, severity, title: `Issue ${id}`, body: `Body of ${id}`, location: 'a.js:1',
   recommendation: `Fix ${id}`, confidence: 0.8, reply: '', ...extra,
 });
-const turn = (verdict, issues) => ({ reply: { verdict, summary: `summary: ${verdict}`, issues } });
+const turn = (verdict, issues, request_check) => ({ reply: { verdict, summary: `summary: ${verdict}`, issues, request_check } });
 
 function scriptCodex(steps) {
   fs.writeFileSync(scriptFile, JSON.stringify(steps));
@@ -503,8 +503,9 @@ await test('C6: owner decisions at the limit end the review even when the histor
 });
 
 // ---- build mode: Codex implements in a worktree on its own branch, Claude reviews
-const author = (summary, responses = []) => ({ reply: { summary, tests: 'node --test: ok', responses, questions: [] } });
-const reviewJSON = (verdict, issues) => JSON.stringify({ verdict, summary: `review: ${verdict}`, issues });
+const matchingRequest = { status: 'matches', notes: 'The requested behavior is covered.' };
+const author = (summary, responses = [], request_check = matchingRequest) => ({ reply: { summary, tests: 'node --test: ok', responses, questions: [], request_check } });
+const reviewJSON = (verdict, issues, request_check = matchingRequest) => JSON.stringify({ verdict, summary: `review: ${verdict}`, issues, request_check });
 const reviewIssue = (iid, status, extra = {}) => ({
   id: iid, status, severity: 'high', title: `Issue ${iid}`, body: `Body of ${iid}`, location: '', recommendation: `Fix ${iid}`, confidence: 0.9, reply: '', ...extra,
 });
@@ -513,7 +514,7 @@ let buildId;
 
 await test('build: Codex implements the spec in a worktree on its own branch', () => {
   scriptCodex([{ ...author('added greet()'), write: { 'greet.js': 'export const greet = (n) => `hi ${n}`;\n' } }]);
-  const r = duet(['start', '--kind', 'build', '--subject', '-'], { input: '# Greeting\nAdd greet(name).\n' });
+  const r = duet(['start', '--kind', 'build', '--subject', '-'], { input: '# Greeting\n\n## Owner\'s request\n> Add greet(name).\n' });
   assert.equal(r.code, 0, r.err);
   buildId = sessionId(r.out);
   const s = state(buildId);
@@ -564,7 +565,7 @@ await test('build: approval ends the loop; finish commits on the branch and remo
 await test('build: finish keeps the spec title whole and names codex-duet once; only a paragraph without a heading is cut', () => {
   const subjectOf = (spec) => {
     scriptCodex([{ ...author('done'), write: { 'note.txt': `${spec.length}\n` } }]);
-    const r = duet(['start', '--kind', 'build', '--subject', '-'], { input: spec });
+    const r = duet(['start', '--kind', 'build', '--subject', '-'], { input: `${spec}\n\n## Owner's request\n> Implement the change described above.\n` });
     assert.equal(r.code, 0, r.err);
     const id = sessionId(r.out);
     scriptCodex([]);
@@ -586,7 +587,7 @@ await test('build: finish keeps the spec title whole and names codex-duet once; 
 
 await test('build: discard removes the worktree and deletes the branch', () => {
   scriptCodex([{ ...author('started'), write: { 'tmp.txt': 'x\n' } }]);
-  const r = duet(['start', '--kind', 'build', '--subject', '-', '--branch', 'try/discard'], { input: 'Try something\n' });
+  const r = duet(['start', '--kind', 'build', '--subject', '-', '--branch', 'try/discard'], { input: "Try something\n\n## Owner's request\n> Try something.\n" });
   assert.equal(r.code, 0, r.err);
   const sid = sessionId(r.out);
   const { subject } = state(sid);
@@ -601,7 +602,7 @@ await test('build: an owner ruling ends a deadlock and reaches Codex as final', 
   const env = { CODEX_DUET_POLICY: path.join(HERE, '..', 'scripts', 'policy.mjs') };
   const dispute = author('kept as is', [{ id: 'C1', action: 'disputed', note: 'the spec allows it' }]);
   scriptCodex([author('done'), dispute, dispute, author('fixed per owner', [{ id: 'C1', action: 'fixed', note: 'x.js:1' }])]);
-  const start = duet(['start', '--kind', 'build', '--subject', '-'], { input: 'Owner ruling test\n', env });
+  const start = duet(['start', '--kind', 'build', '--subject', '-'], { input: "Owner ruling test\n\n## Owner's request\n> Follow the owner's ruling.\n", env });
   assert.equal(start.code, 0, start.err);
   const sid = sessionId(start.out);
   const keepOpen = (reply, owner = false) => reviewJSON('revise', [reviewIssue('C1', 'open', { reply, owner })]);
@@ -625,6 +626,457 @@ await test('build: reply and review keep to their own kind of session', () => {
   const r2 = duet(['review', '--session', id, '--issues', '-'], { input: reviewJSON('approve', []) });
   assert.equal(r2.code, 2);
   assert.match(r2.err, /review is for --kind build sessions/);
+});
+
+// ---- owner brief: preserve the owner's words and enforce the independent checks
+const ownerBrief = "## Owner's request\n> Keep both CSV and JSON exports.\n\n## Accepted amendments\n- none\n\n## Claimed result\nBoth exports work.\n";
+const requestSpec = "# Exports\n\n## Owner's request\n> Keep both CSV and JSON exports.\n\n## Accepted amendments\n- none\n\n## Goal\nImplement both exports.\n";
+const realPolicy = { CODEX_DUET_POLICY: path.join(HERE, '..', 'scripts', 'policy.mjs') };
+
+await test('brief stdin: stored verbatim and passed inside owner_brief, with focus retained', () => {
+  scriptCodex([turn('approve', [], matchingRequest)]);
+  const r = duet(['start', '--kind', 'code', '--brief', '-', '--focus', 'export compatibility'], { input: ownerBrief, env: realPolicy });
+  assert.equal(r.code, 0, r.err);
+  const sid = sessionId(r.out);
+  assert.ok(fs.existsSync(path.join(home, sid, 'brief.md')), 'the brief is stored in the session');
+  assert.equal(fs.readFileSync(path.join(home, sid, 'brief.md'), 'utf8'), ownerBrief);
+  assert.ok(calls()[0].prompt.includes(`<owner_brief>\n${ownerBrief}</owner_brief>`));
+  assert.match(calls()[0].prompt, /<owner_focus>\nexport compatibility\n<\/owner_focus>/);
+  assert.match(calls()[0].prompt, /Request: /);
+  assert.match(r.out, /Owner's request: matches — The requested behavior is covered\./);
+  assert.equal(state(sid).brief, path.join(home, sid, 'brief.md'));
+  assert.deepEqual(state(sid).rounds[0].request_check, matchingRequest);
+  const status = duet(['status', '--session', sid]);
+  assert.equal(status.code, 0, status.err);
+  assert.match(status.out, /Owner's request: matches/);
+  const reportFile = path.join(home, sid, 'report.md');
+  assert.ok(fs.readFileSync(reportFile, 'utf8').includes(reportFile.replace('report.md', 'brief.md')));
+  const report = duet(['report', '--session', sid]);
+  assert.equal(report.code, 0, report.err);
+  assert.match(report.out, /Codex: matches — The requested behavior is covered\./);
+});
+
+await test('brief path: plan stdin stays available, case and heading whitespace are ignored', () => {
+  const briefPath = path.join(tmp, 'owner-brief.md');
+  const brief = "##   oWnEr'S ReQuEsT   \n> Keep exports.\n";
+  fs.writeFileSync(briefPath, brief);
+  scriptCodex([turn('approve', [], matchingRequest)]);
+  const r = duet(['start', '--kind', 'plan', '--subject', '-', '--brief', briefPath], {
+    cwd: tmp, input: '# Plan\nKeep exports.\n', env: realPolicy,
+  });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(fs.readFileSync(path.join(home, sessionId(r.out), 'brief.md'), 'utf8'), brief);
+  assert.ok(calls()[0].prompt.includes(brief));
+  assert.match(calls()[0].prompt, /<subject_file.*\n# Plan/);
+});
+
+await test('no brief: the prompt says none given and the reviewer can report no-brief', () => {
+  scriptCodex([turn('approve', [], { status: 'no-brief', notes: 'No brief supplied.' })]);
+  const r = duet(['start', '--kind', 'code'], { env: realPolicy });
+  assert.equal(r.code, 0, r.err);
+  assert.match(calls()[0].prompt, /<owner_brief>\n\(none given\)\n<\/owner_brief>/);
+  assert.match(r.out, /Owner brief: none/);
+  assert.match(r.out, /Owner's request: no-brief — No brief supplied\./);
+  assert.match(r.out, /Decision: DONE/);
+});
+
+await test('brief and build input refusals leave no session, worktree, branch or Codex call', () => {
+  const invalidDocuments = [
+    '', '## Claimed result\nEverything works.\n', "## Owner's request\n\n## Claimed result\nWorks.\n",
+    "## Owner's request\n>   \n\n## Accepted amendments\n- none\n",
+    "### Owner's request\n> Export both.\n", "```markdown\n## Owner's request\n> Fake heading.\n```\n",
+    "## Owner's request\n# Another section\nUnrelated text.\n",
+  ];
+  const cases = [
+    { args: ['--kind', 'plan', '--subject', '-', '--brief', '-'], input: ownerBrief, message: /stdin|--subject -/ },
+    { args: ['--kind', 'audit', '--subject', '-', '--brief', '-'], input: ownerBrief, message: /--brief.*audit|audit.*--brief/ },
+    { args: ['--kind', 'build', '--subject', '-', '--brief', '-'], input: requestSpec, message: /--brief.*spec|spec.*Owner's request/ },
+    ...invalidDocuments.map((input) => ({ args: ['--kind', 'code', '--brief', '-'], input, message: /non-empty.*## Owner's request/ })),
+    ...invalidDocuments.map((input) => ({ args: ['--kind', 'build', '--subject', '-', '--branch', 'refused/owner-brief'], input, message: /non-empty.*## Owner's request/ })),
+  ];
+  const sessions = fs.readdirSync(home).sort();
+  const branches = git(['for-each-ref', '--format=%(refname)', 'refs/heads']);
+  const worktrees = git(['worktree', 'list', '--porcelain']);
+  for (const { args, input, message } of cases) {
+    scriptCodex([]);
+    const r = duet(['start', ...args], { input });
+    assert.equal(r.code, 2, `${args.join(' ')}: ${r.err}`);
+    assert.match(r.err, message);
+    assert.deepEqual(fs.readdirSync(home).sort(), sessions);
+    assert.equal(git(['for-each-ref', '--format=%(refname)', 'refs/heads']), branches);
+    assert.equal(git(['worktree', 'list', '--porcelain']), worktrees);
+    assert.ok(!fs.existsSync(fakeState), 'refusal precedes any Codex turn');
+  }
+});
+
+await test('review DONE is guarded by the latest request check, even with no issues', () => {
+  for (const [status, decision] of [['matches', 'DONE'], ['narrowed', 'ESCALATE'], ['unclear', 'DONE']]) {
+    scriptCodex([turn('approve', [], { status, notes: '"Keep both CSV and JSON exports": JSON is missing.' })]);
+    const r = duet(['start', '--kind', 'code', '--brief', '-'], { input: ownerBrief, env: realPolicy });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, new RegExp(`Decision: ${decision}`));
+    assert.match(r.out, new RegExp(`Owner's request: ${status}`));
+    const sid = sessionId(r.out);
+    assert.equal(state(sid).decision.enforced, status === 'narrowed' ? true : undefined);
+    assert.match(duet(['status', '--session', sid]).out, new RegExp(`Owner's request: ${status}`));
+    assert.match(fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8'), new RegExp(`Codex: ${status}`));
+    if (status === 'narrowed') assert.match(r.out, /reviewer reports.*narrows the owner's request/);
+  }
+});
+
+await test('request narrowing survives policy conversions to DONE and is reassessed next round', () => {
+  const narrowed = { status: 'narrowed', notes: '"Keep both CSV and JSON exports": only CSV is planned.' };
+  for (const action of ['continue', 'escalate']) {
+    scriptCodex([turn('approve', [], narrowed)]);
+    const r = duet(['start', '--kind', 'code', '--brief', '-'], {
+      input: ownerBrief, env: { FIXTURE_DECISIONS: JSON.stringify({ 1: action }) },
+    });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /Decision: ESCALATE.*enforced by duet.mjs/);
+  }
+  const requestIssue = issue('C1', 'open', 'high', { title: 'Request: JSON export is missing' });
+  scriptCodex([turn('revise', [requestIssue], narrowed), turn('approve', [{ ...requestIssue, status: 'resolved' }], matchingRequest)]);
+  const start = duet(['start', '--kind', 'code', '--brief', '-'], { input: ownerBrief, env: realPolicy });
+  const sid = sessionId(start.out);
+  assert.equal(start.code, 0, start.err);
+  const reply = duet(['reply', '--session', sid, '--responses', '-'], {
+    input: responses('Restored JSON export.', [{ id: 'C1', action: 'fixed', note: 'Both exports now exist.' }]), env: realPolicy,
+  });
+  assert.equal(reply.code, 0, reply.err);
+  assert.match(reply.out, /Decision: DONE/);
+  assert.match(calls()[1].prompt, /owner brief from round 1 still applies/i);
+  assert.match(calls()[1].prompt, /request_check/);
+  assert.deepEqual(state(sid).rounds.map((r) => r.request_check.status), ['narrowed', 'matches']);
+});
+
+await test('older and malformed Codex checks normalize to unclear without crashing', () => {
+  for (const request_check of [undefined, null, [], 'matches', { status: 'wrong', notes: 'x' }, { status: 'matches' }, { status: 'matches', notes: 1 }]) {
+    scriptCodex([turn('approve', [], request_check)]);
+    const r = duet(['start', '--kind', 'code'], { env: realPolicy });
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /Decision: DONE/);
+    assert.match(r.out, /Owner's request: unclear — \(not reported\)/);
+    assert.deepEqual(state(sessionId(r.out)).rounds[0].request_check, { status: 'unclear', notes: '(not reported)' });
+  }
+});
+
+await test('build checks the spec against the request and refuses invalid approvals without changing state', () => {
+  scriptCodex([author('Implemented both exports.')]);
+  const start = duet(['start', '--kind', 'build', '--subject', '-'], { input: requestSpec, env: realPolicy });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  assert.ok(calls()[0].prompt.includes(requestSpec.trim()));
+  assert.match(calls()[0].prompt, /before building/i);
+  assert.match(calls()[0].prompt, /request_check/);
+  assert.match(calls()[0].prompt, /questions/);
+  assert.match(start.out, /Owner's request: matches/);
+  const before = state(sid);
+  const reviews = [undefined, null, { status: 'matches' }, { status: 'narrowed', notes: 'JSON is missing.' }, { status: 'no-brief', notes: '' }];
+  for (const request_check of reviews) {
+    const r = duet(['review', '--session', sid, '--issues', '-'], {
+      input: JSON.stringify({ verdict: 'approve', summary: 'Looks good.', issues: [], request_check }), env: realPolicy,
+    });
+    assert.equal(r.code, 2, r.err);
+    assert.match(r.err, /approve|approval/i);
+    assert.match(r.err, /request_check|raise an issue/i);
+    assert.deepEqual(state(sid), before, 'a refused approval must not mutate the session');
+    assert.equal(calls().length, 1);
+  }
+  const approved = duet(['review', '--session', sid, '--issues', '-'], { input: reviewJSON('approve', []), env: realPolicy });
+  assert.equal(approved.code, 0, approved.err);
+  assert.match(approved.out, /Decision: DONE/);
+  assert.match(approved.out, /Owner's request: matches/);
+  assert.match(approved.out, /Owner's request \(Claude\): matches/);
+  assert.deepEqual(state(sid).rounds[0].author.request_check, matchingRequest);
+  assert.deepEqual(state(sid).rounds[0].request_check, matchingRequest);
+  const status = duet(['status', '--session', sid]);
+  assert.match(status.out, /Owner's request \(Claude\): matches/);
+  const report = fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8');
+  assert.ok(report.includes(path.join(home, sid, 'spec.md')));
+  assert.match(report, /Codex: matches/);
+  assert.match(report, /Claude: matches/);
+});
+
+await test('build disagreement escalates with both checks, including missing and malformed implementer checks', () => {
+  for (const request_check of [
+    { status: 'narrowed', notes: '"Keep both CSV and JSON exports": only CSV exists.' },
+    { status: 'unclear', notes: 'Cannot verify JSON without a sample.' },
+    undefined, { status: 'matches', notes: false }, { status: 'no-brief', notes: 'Invalid in a build.' },
+  ]) {
+    const reply = { summary: 'Built exports.', tests: 'ok', responses: [], questions: [], request_check };
+    scriptCodex([{ reply }]);
+    const start = duet(['start', '--kind', 'build', '--subject', '-'], { input: requestSpec, env: realPolicy });
+    assert.equal(start.code, 0, start.err);
+    const sid = sessionId(start.out);
+    const status = ['narrowed', 'unclear'].includes(request_check?.status) ? request_check.status : 'unclear';
+    const approved = duet(['review', '--session', sid, '--issues', '-'], { input: reviewJSON('approve', []), env: realPolicy });
+    assert.equal(approved.code, 0, approved.err);
+    assert.match(approved.out, /Decision: ESCALATE.*enforced by duet.mjs/);
+    assert.match(approved.out, new RegExp(`Owner's request: ${status}`));
+    assert.match(approved.out, /Owner's request \(Claude\): matches/);
+    assert.equal(state(sid).decision.enforced, true);
+    assert.equal(calls().length, 1);
+    const report = fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8');
+    assert.match(report, new RegExp(`Codex: ${status}`));
+    assert.match(report, /Claude: matches/);
+    assert.match(duet(['status', '--session', sid]).out, new RegExp(`Owner's request: ${status}`));
+    assert.equal(duet(['discard', '--session', sid]).code, 0);
+  }
+});
+
+await test('build later rounds use the current implementer check and retain the latest reviewer check', () => {
+  const specPath = path.join(tmp, 'export-spec.md');
+  fs.writeFileSync(specPath, requestSpec);
+  const narrowed = { status: 'narrowed', notes: '"Keep both CSV and JSON exports": JSON is missing.' };
+  for (const [first, current, decision] of [[narrowed, matchingRequest, 'DONE'], [matchingRequest, narrowed, 'ESCALATE']]) {
+    scriptCodex([author('First implementation.', [], first), author('Updated implementation.', [{ id: 'C1', action: 'fixed', note: 'Checked both exports.' }], current)]);
+    const start = duet(['start', '--kind', 'build', '--subject', specPath], { env: realPolicy });
+    assert.equal(start.code, 0, start.err);
+    const sid = sessionId(start.out);
+    const revised = duet(['review', '--session', sid, '--issues', '-'], { input: reviewJSON('revise', [reviewIssue('C1', 'open')], first), env: realPolicy });
+    assert.equal(revised.code, 0, revised.err);
+    assert.match(revised.out, new RegExp(`Owner's request: ${current.status}`));
+    assert.match(revised.out, new RegExp(`Owner's request \\(Claude, round 1\\): ${first.status}`));
+    assert.match(calls()[1].prompt, /Re-check the implementation as it stands/);
+    assert.match(calls()[1].prompt, /request_check/);
+    const pendingReport = duet(['report', '--session', sid]);
+    assert.equal(pendingReport.code, 0, pendingReport.err);
+    assert.match(pendingReport.out, new RegExp(`Codex: ${current.status}`));
+    assert.match(pendingReport.out, new RegExp(`Claude: ${first.status}`));
+    const approved = duet(['review', '--session', sid, '--issues', '-'], { input: reviewJSON('approve', [reviewIssue('C1', 'resolved')]), env: realPolicy });
+    assert.equal(approved.code, 0, approved.err);
+    assert.match(approved.out, new RegExp(`Decision: ${decision}`));
+    const rounds = state(sid).rounds;
+    assert.deepEqual(rounds.map((r) => r.author.request_check), [first, current]);
+    assert.deepEqual(rounds.map((r) => r.request_check), [first, matchingRequest]);
+    assert.equal(calls().length, 2);
+    assert.equal(duet(['discard', '--session', sid]).code, 0);
+  }
+});
+
+await test('an owner ruling still gives Codex a turn after a request-check disagreement', () => {
+  const narrowed = { status: 'narrowed', notes: '"Keep both CSV and JSON exports": JSON is missing.' };
+  scriptCodex([author('CSV only.', [], narrowed), author('Both exports.', [{ id: 'C1', action: 'fixed', note: 'Followed the owner ruling.' }])]);
+  const start = duet(['start', '--kind', 'build', '--subject', '-'], { input: requestSpec, env: realPolicy });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  const gap = reviewIssue('C1', 'open', { severity: 'medium', title: 'Request: retain JSON export', body: narrowed.notes });
+  const approve = (extra) => duet(['review', '--session', sid, '--issues', '-'], {
+    input: reviewJSON('approve', [{ ...gap, ...extra }]), env: realPolicy,
+  });
+  assert.match(approve({}).out, /Decision: ESCALATE.*enforced by duet.mjs/);
+  const ruled = approve({ owner: true, reply: 'Owner decision: retain JSON export.' });
+  assert.equal(ruled.code, 0, ruled.err);
+  assert.equal(calls().length, 2);
+  assert.match(calls()[1].prompt, /Owner decision \(final\): Owner decision: retain JSON export/);
+  assert.equal(state(sid).phase, 'awaiting-review');
+  assert.equal(state(sid).issues.C1.ownerRuled, true);
+  const done = approve({ status: 'resolved' });
+  assert.equal(done.code, 0, done.err);
+  assert.match(done.out, /Decision: DONE/);
+  assert.equal(duet(['discard', '--session', sid]).code, 0);
+});
+
+await test('request ruling: the owner can settle either build disagreement, and the ruling persists', () => {
+  for (const codexStatus of ['narrowed', 'unclear']) {
+    for (const status of ['matches', 'narrowed-accepted']) {
+      const check = { status: codexStatus, notes: 'Cannot verify both exports.' };
+      scriptCodex([author('Export implementation.', [], check), author('Verified the new issue.', [{ id: 'C1', action: 'fixed', note: 'Verified CSV.' }], check)]);
+      const start = duet(['start', '--kind', 'build', '--subject', '-'], { input: requestSpec, env: realPolicy });
+      assert.equal(start.code, 0, start.err);
+      const sid = sessionId(start.out);
+      const review = (verdict, issues, request_check = matchingRequest) => duet(['review', '--session', sid, '--issues', '-'], {
+        input: reviewJSON(verdict, issues, request_check), env: realPolicy,
+      });
+      assert.match(review('approve', []).out, /Decision: ESCALATE/);
+      const ruling = { status, notes: 'The owner accepts the export result after inspecting it.', owner: true };
+      const settled = review('approve', [], ruling);
+      assert.equal(settled.code, 0, settled.err);
+      assert.match(settled.out, /Decision: DONE/);
+      assert.match(settled.out, /Owner decision \(final\).*The owner accepts the export result/);
+      assert.deepEqual(state(sid).rounds[0].request_check, ruling);
+      assert.equal(state(sid).requestRuling.notes, ruling.notes);
+      assert.equal(calls().length, 1, 'settling an approval needs no new Codex turn');
+      assert.match(duet(['status', '--session', sid]).out, /Owner decision \(final\).*The owner accepts/);
+      assert.match(fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8'), /Owner decision \(final\).*The owner accepts/);
+      if (status === 'narrowed-accepted') assert.match(settled.out, /Owner's request \(Claude\): narrowed-accepted/);
+      assert.match(review('approve', []).out, /Decision: DONE/, 'an ordinary review does not erase the ruling');
+      const gap = reviewIssue('C1', 'open', { title: 'Request: preserve CSV export' });
+      const next = review('revise', [gap]);
+      assert.equal(next.code, 0, next.err);
+      assert.equal(state(sid).phase, 'awaiting-review', 'ordinary high issues still get a Codex turn');
+      assert.ok(calls()[1].prompt.includes(`Owner decision (final): ${status} — ${ruling.notes}`));
+      assert.match(calls()[1].prompt, /accepted amendment/);
+      assert.match(review('approve', [{ ...gap, status: 'resolved' }]).out, /Decision: DONE/);
+      assert.equal(duet(['discard', '--session', sid]).code, 0);
+    }
+  }
+});
+
+await test('request ruling: a review narrowing without issues can be settled and Codex sees the amendment every round', () => {
+  const narrowed = { status: 'narrowed', notes: 'The owner asked for both exports; JSON is absent.' };
+  const gap = issue('C1', 'open', 'high', { title: 'Request: CSV is incomplete' });
+  scriptCodex([turn('approve', [], narrowed), turn('approve', [], narrowed), turn('revise', [gap], narrowed)]);
+  const start = duet(['start', '--kind', 'code', '--brief', '-'], { input: ownerBrief, env: realPolicy });
+  assert.equal(start.code, 0, start.err);
+  assert.match(start.out, /Decision: ESCALATE/);
+  const sid = sessionId(start.out);
+  const decision = 'The owner accepts CSV only for this release.';
+  const settled = duet(['reply', '--session', sid, '--responses', '-'], {
+    input: JSON.stringify({ changes: 'Owner settled the scope.', responses: [], request_ruling: decision }), env: realPolicy,
+  });
+  assert.equal(settled.code, 0, settled.err);
+  assert.match(settled.out, /Decision: DONE/);
+  assert.equal(calls().length, 2);
+  assert.ok(calls()[1].prompt.includes(`Owner decision (final): ${decision}`));
+  assert.match(calls()[1].prompt, /accepted amendment/);
+  assert.equal(state(sid).requestRuling.notes, decision);
+  assert.match(settled.out, /Owner decision \(final\).*The owner accepts CSV only/);
+  assert.match(duet(['status', '--session', sid]).out, /Owner decision \(final\).*The owner accepts CSV only/);
+  const report = fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8');
+  assert.match(report, /Owner decision \(final\).*The owner accepts CSV only/);
+  const next = duet(['reply', '--session', sid, '--responses', '-'], { input: responses('Check CSV again.', []), env: realPolicy });
+  assert.equal(next.code, 0, next.err);
+  assert.match(next.out, /Decision: ESCALATE — stall:/, 'a ruling does not waive the ordinary stall policy for new issues');
+  assert.equal(state(sid).issues.C1.status, 'open');
+  assert.ok(calls()[2].prompt.includes(decision));
+});
+
+await test('a request ruling does not override an unrelated parked build issue', () => {
+  const first = reviewIssue('C1', 'open');
+  const second = reviewIssue('C2', 'open');
+  scriptCodex([
+    author('Done.'),
+    author('Needs an owner decision.', [
+      { id: 'C1', action: 'needs-user', note: 'The owner must choose the CSV format.' },
+      { id: 'C2', action: 'disputed', note: 'Current JSON format is correct.' },
+    ]),
+    author('An unrelated ruling should not start this turn.'),
+  ]);
+  const start = duet(['start', '--kind', 'build', '--subject', '-'], { input: requestSpec, env: realPolicy });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  const review = (request_check) => duet(['review', '--session', sid, '--issues', '-'], {
+    input: reviewJSON('revise', [first, second], request_check), env: realPolicy,
+  });
+  assert.equal(review(matchingRequest).code, 0);
+  const ruled = review({ status: 'matches', notes: 'The owner confirmed the requested scope.', owner: true });
+  assert.equal(ruled.code, 0, ruled.err);
+  assert.match(ruled.out, /Decision: ESCALATE — critical\/high decision parked/);
+  assert.equal(state(sid).issues.C1.parked, true);
+  assert.equal(calls().length, 2);
+  assert.equal(duet(['discard', '--session', sid]).code, 0);
+});
+
+await test('request rulings may be recorded before escalation and cannot be forged by a Codex check', () => {
+  scriptCodex([author('Done.')]);
+  const build = duet(['start', '--kind', 'build', '--subject', '-'], { input: requestSpec, env: realPolicy });
+  assert.equal(build.code, 0, build.err);
+  const bid = sessionId(build.out);
+  const approved = duet(['review', '--session', bid, '--issues', '-'], {
+    input: reviewJSON('approve', [], { status: 'narrowed-accepted', notes: 'The owner accepted CSV only before review.', owner: true }), env: realPolicy,
+  });
+  assert.equal(approved.code, 0, approved.err);
+  assert.match(approved.out, /Decision: DONE/);
+  assert.equal(duet(['discard', '--session', bid]).code, 0);
+  const fakeRuling = { status: 'narrowed', notes: 'The reviewer cannot grant an owner ruling.', owner: true };
+  scriptCodex([turn('approve', [], fakeRuling), turn('approve', [], fakeRuling)]);
+  const start = duet(['start', '--kind', 'code', '--brief', '-'], { input: ownerBrief, env: realPolicy });
+  assert.equal(start.code, 0, start.err);
+  assert.match(start.out, /Decision: ESCALATE/);
+  assert.equal(state(sessionId(start.out)).requestRuling, undefined);
+  scriptCodex([turn('approve', [], matchingRequest), turn('approve', [], fakeRuling)]);
+  const matching = duet(['start', '--kind', 'code', '--brief', '-'], { input: ownerBrief, env: realPolicy });
+  const ruled = duet(['reply', '--session', sessionId(matching.out), '--responses', '-'], {
+    input: JSON.stringify({ changes: '', responses: [], request_ruling: 'The owner now accepts CSV only.' }), env: realPolicy,
+  });
+  assert.equal(ruled.code, 0, ruled.err);
+  assert.match(ruled.out, /Decision: DONE/);
+});
+
+await test('request rulings are validated without changing state, and do not skip issue answers or round limits', () => {
+  scriptCodex([author('Done.')]);
+  const build = duet(['start', '--kind', 'build', '--subject', '-', '--max-rounds', '1'], { input: requestSpec, env: realPolicy });
+  const bid = sessionId(build.out);
+  const before = state(bid);
+  for (const request_check of [
+    { status: 'matches', notes: '', owner: true }, { status: 'matches', notes: 'x', owner: 'true' },
+    { status: 'narrowed-accepted', notes: 'x' }, { status: 'unclear', notes: 'x', owner: true },
+    { status: 'narrowed', notes: 'x', owner: true },
+  ]) {
+    const r = duet(['review', '--session', bid, '--issues', '-'], { input: reviewJSON('approve', [], request_check), env: realPolicy });
+    assert.equal(r.code, 2, r.err);
+    assert.match(r.err, /request_check|owner ruling/);
+    assert.deepEqual(state(bid), before);
+  }
+  const ruledAtLimit = duet(['review', '--session', bid, '--issues', '-'], {
+    input: reviewJSON('revise', [reviewIssue('C1', 'open')], { status: 'matches', notes: 'The owner clarified the request.', owner: true }), env: realPolicy,
+  });
+  assert.equal(ruledAtLimit.code, 0, ruledAtLimit.err);
+  assert.match(ruledAtLimit.out, /Decision: ESCALATE — round limit/);
+  assert.equal(calls().length, 1);
+  assert.equal(duet(['discard', '--session', bid]).code, 0);
+  const gap = issue('C1', 'open');
+  const narrowed = { status: 'narrowed', notes: 'JSON is missing.' };
+  scriptCodex([turn('approve', [gap], narrowed)]);
+  const review = duet(['start', '--kind', 'code', '--brief', '-', '--max-rounds', '1'], { input: ownerBrief, env: realPolicy });
+  const rid = sessionId(review.out);
+  const reviewBefore = state(rid);
+  for (const request_ruling of ['', '  ', null, 1, {}]) {
+    const r = duet(['reply', '--session', rid, '--responses', '-'], {
+      input: JSON.stringify({ changes: '', responses: [], request_ruling }), env: realPolicy,
+    });
+    assert.equal(r.code, 2, r.err);
+    assert.match(r.err, /request_ruling/);
+    assert.deepEqual(state(rid), reviewBefore);
+  }
+  const skipped = duet(['reply', '--session', rid, '--responses', '-'], {
+    input: JSON.stringify({ changes: '', responses: [], request_ruling: 'Accept CSV only.' }), env: realPolicy,
+  });
+  assert.equal(skipped.code, 2, skipped.err);
+  assert.match(skipped.err, /missing: C1/);
+  assert.deepEqual(state(rid), reviewBefore);
+  const settled = duet(['reply', '--session', rid, '--responses', '-'], {
+    input: JSON.stringify({ changes: '', responses: [{ id: 'C1', action: 'owner-decided', note: 'Accepted.' }], request_ruling: 'Accept CSV only.' }), env: realPolicy,
+  });
+  assert.equal(settled.code, 0, settled.err);
+  assert.match(settled.out, /Decision: DONE/);
+  assert.match(settled.out, /Owner decision \(final\).*Accept CSV only/);
+  assert.equal(calls().length, 1, 'rulings at the limit are recorded without spending another round');
+});
+
+await test('owner request headings accept typographic and modifier apostrophes without rewriting the brief', () => {
+  for (const apostrophe of ['\u2019', '\u02bc']) {
+    const brief = `## Owner${apostrophe}s request\n> Keep exports.\n\n## Accepted amendments\n\n## Claimed result\n`;
+    scriptCodex([turn('approve', [], matchingRequest)]);
+    const review = duet(['start', '--kind', 'code', '--brief', '-'], { input: brief, env: realPolicy });
+    assert.equal(review.code, 0, review.err);
+    assert.equal(fs.readFileSync(path.join(home, sessionId(review.out), 'brief.md'), 'utf8'), brief);
+    assert.ok(calls()[0].prompt.includes(brief));
+    scriptCodex([author('Done.')]);
+    const build = duet(['start', '--kind', 'build', '--subject', '-'], { input: `# Exports\n\n${brief}`, env: realPolicy });
+    assert.equal(build.code, 0, build.err);
+    assert.equal(duet(['discard', '--session', sessionId(build.out)]).code, 0);
+  }
+});
+
+await test('brief file errors are usage errors and leave no session or Codex call', () => {
+  const unreadable = path.join(tmp, 'unreadable-brief.md');
+  fs.writeFileSync(unreadable, ownerBrief, { mode: 0o000 });
+  try {
+    for (const file of [path.join(tmp, 'missing-brief.md'), tmp, ...(process.getuid?.() === 0 ? [] : [unreadable])]) {
+      const sessions = fs.readdirSync(home).sort();
+      scriptCodex([]);
+      const r = duet(['start', '--kind', 'code', '--brief', file]);
+      assert.equal(r.code, 2, r.err);
+      assert.match(r.err, /cannot read --brief/);
+      assert.ok(r.err.includes(file));
+      assert.deepEqual(fs.readdirSync(home).sort(), sessions);
+      assert.ok(!fs.existsSync(fakeState));
+    }
+  } finally {
+    fs.chmodSync(unreadable, 0o600);
+  }
 });
 
 // ---- model and effort, checked against the owner's Codex (a stand-in CODEX_HOME)
@@ -808,7 +1260,7 @@ await test("retry: without Codex's log of the cut-off thread, or with --fresh, t
 
 await test('retry: a build cut off in its first turn goes on in its own thread', () => {
   scriptCodex([{ hang: true, started: true, tier: 'default' }, author('finished the cut-off work')]);
-  const r = duet(['start', '--kind', 'build', '--subject', '-'], { input: 'A long task\n', env: cutOff });
+  const r = duet(['start', '--kind', 'build', '--subject', '-'], { input: "A long task\n\n## Owner's request\n> Complete the long task.\n", env: cutOff });
   assert.equal(r.code, 1, r.err);
   const sid = retrySid(r.err);
   const thread = state(sid).pending.threadId;

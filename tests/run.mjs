@@ -553,11 +553,20 @@ await test('build: approval ends the loop; finish commits on the branch and remo
   assert.match(r.out, /Decision: DONE/);
   assert.match(r.out, /finish --session/);
   assert.ok(!fs.existsSync(fakeState), 'no Codex turn after an approval');
-  const { subject } = state(buildId);
+  const { subject, approval, rounds } = state(buildId);
+  assert.equal(approval.tree, rounds.at(-1).snapshot.tree);
+  assert.equal(approval.round, 2);
+  assert.ok(!Number.isNaN(Date.parse(approval.at)));
   const f = duet(['finish', '--session', buildId], { env: gitIdentity });
   assert.equal(f.code, 0, f.err);
   assert.ok(!fs.existsSync(subject.worktree), 'the worktree is removed');
   assert.equal(state(buildId).phase, 'finished');
+  assert.equal(git(['rev-parse', `${subject.branch}^{tree}`]).trim(), approval.tree);
+  for (const tree of [subject.base, approval.tree]) assert.ok(f.out.includes(tree), f.out);
+  assert.match(f.out, /approved and committed trees are equal/i);
+  const report = fs.readFileSync(path.join(home, buildId, 'report.md'), 'utf8');
+  assert.ok(report.includes(`Approved tree: ${approval.tree}`), report);
+  assert.ok(report.includes(`Committed tree: ${approval.tree}`), report);
   assert.match(spawnSync('git', ['show', `${subject.branch}:greet.js`], { cwd: repo, encoding: 'utf8' }).stdout, /"there"/);
   assert.equal(spawnSync('git', ['log', '-1', '--format=%s', subject.branch], { cwd: repo, encoding: 'utf8' }).stdout.trim(), 'codex-duet: Greeting');
 });
@@ -632,6 +641,349 @@ await test('build: reply and review keep to their own kind of session', () => {
 const ownerBrief = "## Owner's request\n> Keep both CSV and JSON exports.\n\n## Accepted amendments\n- none\n\n## Claimed result\nBoth exports work.\n";
 const requestSpec = "# Exports\n\n## Owner's request\n> Keep both CSV and JSON exports.\n\n## Accepted amendments\n- none\n\n## Goal\nImplement both exports.\n";
 const realPolicy = { CODEX_DUET_POLICY: path.join(HERE, '..', 'scripts', 'policy.mjs') };
+
+// Approval checks use real trees, indexes, commits and hooks in separate repositories.
+let approvalRepos = 0;
+function approvalRepo() {
+  const dir = path.join(tmp, `approval-${++approvalRepos}`);
+  fs.mkdirSync(dir);
+  git(['init', '-q'], dir);
+  git(['config', 'core.filemode', 'true'], dir);
+  git(['config', 'core.hooksPath', path.join(dir, '.git', 'hooks')], dir);
+  for (const file of ['reviewed.txt', 'covered.txt', 'deleted.txt', 'rename.txt', 'untouched.txt', 'mode.sh']) {
+    fs.writeFileSync(path.join(dir, file), `base ${file}\n`);
+  }
+  git(['add', '-A'], dir);
+  commit('base', dir);
+  return dir;
+}
+
+function approvalBuild({ maxRounds = 10, steps = [] } = {}) {
+  const dir = approvalRepo();
+  scriptCodex([{
+    ...author('implemented'),
+    write: { 'reviewed.txt': 'approved\n', 'covered.txt': 'approved covered\n' },
+  }, ...steps]);
+  const start = duet(['start', '--kind', 'build', '--subject', '-', '--max-rounds', String(maxRounds)], {
+    cwd: dir, input: requestSpec, env: realPolicy,
+  });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  return { dir, sid, ...state(sid).subject };
+}
+
+function approveBuild(sid, issues = []) {
+  const r = duet(['review', '--session', sid, '--issues', '-'], { input: reviewJSON('approve', issues), env: realPolicy });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /Decision: DONE/);
+  return r;
+}
+
+await test('approval: build drift commits nothing and returns an approved-to-current round; approving it can finish', () => {
+  const { sid, dir, worktree, branch, base } = approvalBuild();
+  approveBuild(sid);
+  const approved = state(sid).approval.tree;
+  const before = git(['rev-parse', branch], dir);
+  const index = git(['ls-files', '--stage'], worktree);
+  fs.writeFileSync(path.join(worktree, 'reviewed.txt'), 'after review\n');
+  fs.writeFileSync(path.join(worktree, 'new.txt'), 'untracked\n');
+  const f = duet(['finish', '--session', sid], { env: gitIdentity });
+  assert.equal(f.code, 0, f.err);
+  assert.match(f.out, /^Nothing was committed/i);
+  assert.match(f.out, /edited-after-review.*reviewed\.txt/);
+  assert.match(f.out, /never-reviewed.*new\.txt/);
+  assert.match(f.out, /covered.*covered\.txt/);
+  assert.equal(git(['rev-parse', branch], dir), before);
+  assert.equal(git(['ls-files', '--stage'], worktree), index, 'drift must not stage anything');
+  const s = state(sid);
+  assert.equal(s.round, 2);
+  assert.equal(s.phase, 'awaiting-review');
+  assert.equal(s.approval, undefined);
+  const last = s.rounds.at(-1);
+  assert.equal(last.kind, 'post-approval');
+  assert.equal(last.author.request_check, undefined, 'this is not a Codex turn');
+  assert.equal(calls().length, 1);
+  const delta = git(['diff', '--no-renames', approved, last.snapshot.tree], dir);
+  assert.ok(f.out.includes(delta.trim()), f.out);
+  assert.match(f.out, /This round.*diff/);
+  assert.match(f.out, /review --session/);
+  assert.match(f.out, /Owner's request: matches — The requested behavior is covered/);
+  const report = duet(['report', '--session', sid]);
+  assert.match(report.out, /post-approval/);
+  assert.match(report.out, /Codex: matches — The requested behavior is covered/);
+  const reapproved = approveBuild(sid);
+  assert.match(reapproved.out, /Owner's request: matches — The requested behavior is covered/);
+  assert.equal(state(sid).approval.tree, last.snapshot.tree);
+  const finished = duet(['finish', '--session', sid], { env: gitIdentity });
+  assert.equal(finished.code, 0, finished.err);
+  assert.equal(git(['rev-parse', `${branch}^{tree}`], dir).trim(), last.snapshot.tree);
+  assert.equal(git(['show', `${branch}:new.txt`], dir), 'untracked\n');
+  const savedReport = fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8');
+  for (const tree of [base, last.snapshot.tree]) assert.ok(savedReport.includes(tree), savedReport);
+  const verify = duet(['verify', '--session', sid]);
+  assert.equal(verify.code, 0, verify.err);
+  assert.match(verify.out, /branch commit/i);
+  assert.match(verify.out, /matches the approved tree\n$/);
+});
+
+await test('approval: revising a post-approval round gives Codex the next turn and latest check', () => {
+  const nextCheck = { status: 'matches', notes: 'The fix still covers both exports.' };
+  const { sid, worktree } = approvalBuild({ steps: [{
+    ...author('fixed drift', [{ id: 'C1', action: 'fixed', note: 'reviewed.txt:1' }], nextCheck),
+    write: { 'reviewed.txt': 'fixed by Codex\n' },
+  }] });
+  approveBuild(sid);
+  fs.writeFileSync(path.join(worktree, 'reviewed.txt'), 'drift\n');
+  assert.equal(duet(['finish', '--session', sid]).code, 0);
+  const r = duet(['review', '--session', sid, '--issues', '-'], {
+    input: reviewJSON('revise', [reviewIssue('C1', 'open', { body: 'Fix the drift.' })]), env: realPolicy,
+  });
+  assert.equal(r.code, 0, r.err);
+  assert.equal(state(sid).round, 3);
+  assert.equal(state(sid).phase, 'awaiting-review');
+  assert.equal(state(sid).approval, undefined);
+  assert.equal(calls().length, 2);
+  assert.match(calls()[1].prompt, /Fix the drift/);
+  assert.match(r.out, /Owner's request: matches — The fix still covers both exports/);
+  approveBuild(sid, [reviewIssue('C1', 'resolved')]);
+  assert.equal(duet(['discard', '--session', sid]).code, 0);
+});
+
+await test('approval: post-approval review consumes a round and respects the Codex round limit', () => {
+  const { sid, worktree } = approvalBuild({ maxRounds: 2 });
+  approveBuild(sid);
+  fs.writeFileSync(path.join(worktree, 'reviewed.txt'), 'drift\n');
+  assert.equal(duet(['finish', '--session', sid]).code, 0);
+  const r = duet(['review', '--session', sid, '--issues', '-'], {
+    input: reviewJSON('revise', [reviewIssue('C1', 'open')]), env: realPolicy,
+  });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /round limit 2 reached/);
+  assert.equal(state(sid).phase, 'escalated');
+  assert.equal(calls().length, 1);
+  assert.equal(duet(['discard', '--session', sid]).code, 0);
+});
+
+await test('approval: approval names drift written by reviewer tests before finish is called', () => {
+  const { sid, worktree } = approvalBuild();
+  const reviewed = state(sid).rounds.at(-1).snapshot.tree;
+  fs.writeFileSync(path.join(worktree, 'test-output.txt'), 'reviewer test wrote this\n');
+  const r = approveBuild(sid);
+  assert.equal(state(sid).approval.tree, reviewed, 'approve binds the reviewed snapshot, not a fresh one');
+  assert.match(r.out, /never-reviewed.*test-output\.txt/);
+  assert.match(r.out, /finish.*back.*review/i);
+  assert.equal(duet(['discard', '--session', sid]).code, 0);
+});
+
+await test('approval: rewriting commit hooks leave no commit, keep their edit, and return it for review', () => {
+  const { sid, dir, worktree, branch } = approvalBuild();
+  approveBuild(sid);
+  const before = git(['rev-parse', branch], dir);
+  const hook = path.join(dir, '.git', 'hooks', 'pre-commit');
+  fs.writeFileSync(hook, '#!/bin/sh\nprintf "hook edit\\n" >> reviewed.txt\ngit add reviewed.txt\n', { mode: 0o755 });
+  const f = duet(['finish', '--session', sid], { env: gitIdentity });
+  assert.equal(f.code, 0, f.err);
+  assert.match(f.out, /^Nothing was committed/i);
+  assert.match(f.out, /commit hooks/i);
+  assert.match(f.out, /edited-after-review.*reviewed\.txt/);
+  assert.equal(git(['rev-parse', branch], dir), before);
+  assert.equal(fs.readFileSync(path.join(worktree, 'reviewed.txt'), 'utf8'), 'approved\nhook edit\n');
+  assert.equal(state(sid).phase, 'awaiting-review');
+  assert.equal(state(sid).rounds.at(-1).kind, 'post-approval');
+  fs.rmSync(hook);
+  approveBuild(sid);
+  assert.equal(duet(['finish', '--session', sid], { env: gitIdentity }).code, 0);
+});
+
+await test('approval: rejecting commit hooks preserve the session, files and index for a later finish', () => {
+  const { sid, dir, worktree, branch } = approvalBuild();
+  approveBuild(sid);
+  const before = state(sid);
+  const head = git(['rev-parse', branch], dir);
+  const status = git(['status', '--porcelain'], worktree);
+  const hook = path.join(dir, '.git', 'hooks', 'pre-commit');
+  fs.writeFileSync(hook, '#!/bin/sh\necho "hook says no" >&2\nexit 1\n', { mode: 0o755 });
+  const f = duet(['finish', '--session', sid], { env: gitIdentity });
+  assert.equal(f.code, 1);
+  assert.match(f.err, /hook says no/);
+  assert.deepEqual(state(sid), before);
+  assert.equal(git(['rev-parse', branch], dir), head);
+  assert.equal(git(['status', '--porcelain'], worktree), status);
+  assert.equal(fs.readFileSync(path.join(worktree, 'reviewed.txt'), 'utf8'), 'approved\n');
+  fs.rmSync(hook);
+  const retry = duet(['finish', '--session', sid], { env: gitIdentity });
+  assert.equal(retry.code, 0, retry.err);
+});
+
+await test('approval: finish without DONE requires --unreviewed and records the owner override', () => {
+  const { sid, dir, branch } = approvalBuild();
+  const before = state(sid);
+  const f = duet(['finish', '--session', sid], { env: gitIdentity });
+  assert.equal(f.code, 2);
+  assert.match(f.err, /content.*not approved/i);
+  assert.match(f.err, /finish --unreviewed/);
+  assert.deepEqual(state(sid), before);
+  const override = duet(['finish', '--session', sid, '--unreviewed'], { env: gitIdentity });
+  assert.equal(override.code, 0, override.err);
+  const body = git(['log', '-1', '--format=%b', branch], dir);
+  assert.match(body, /owner finished without an approval/i);
+  assert.match(body, /round 1.*phase awaiting-review/);
+  assert.equal(state(sid).finish.unreviewed, true);
+  const report = fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8');
+  assert.match(report, /owner finished without an approval/i);
+  assert.match(report, /round 1.*phase awaiting-review/);
+});
+
+await test('approval: --unreviewed skips drift and hook checks but reports paths against the last approval', () => {
+  const { sid, dir, branch, worktree } = approvalBuild();
+  approveBuild(sid);
+  const approved = state(sid).approval.tree;
+  fs.writeFileSync(path.join(worktree, 'reviewed.txt'), 'drift\n');
+  // First lose the active approval through the normal post-approval path.
+  assert.equal(duet(['finish', '--session', sid]).code, 0);
+  fs.writeFileSync(path.join(dir, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\nprintf "hook edit\\n" >> reviewed.txt\ngit add reviewed.txt\n', { mode: 0o755 });
+  const r = duet(['finish', '--session', sid, '--unreviewed'], { env: gitIdentity });
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /edited-after-review.*reviewed\.txt/);
+  assert.equal(git(['show', `${branch}:reviewed.txt`], dir), 'drift\nhook edit\n');
+  const report = fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8');
+  assert.ok(report.includes(approved), report);
+  assert.match(report, /edited-after-review.*reviewed\.txt/);
+  assert.match(report, /owner finished without an approval/i);
+});
+
+await test('approval: code verify and done status detect edits, and the printed reply re-reviews them', () => {
+  const dir = approvalRepo();
+  fs.writeFileSync(path.join(dir, 'reviewed.txt'), 'approved\n');
+  scriptCodex([turn('approve', [], matchingRequest), turn('approve', [], matchingRequest)]);
+  const start = duet(['start', '--kind', 'code'], { cwd: dir, env: realPolicy });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  const approved = state(sid).approval;
+  assert.equal(approved.tree, state(sid).rounds[0].snapshot.tree);
+  const index = git(['ls-files', '--stage'], dir);
+  const verify = duet(['verify', '--session', sid], { cwd: dir });
+  assert.equal(verify.code, 0, verify.err);
+  assert.ok(verify.out.includes(approved.tree));
+  assert.match(verify.out, /covered.*reviewed\.txt/);
+  assert.match(verify.out, /matches the approved tree\n$/);
+  assert.match(duet(['status', '--session', sid]).out, /matches the approved tree\n$/);
+  fs.writeFileSync(path.join(dir, 'reviewed.txt'), 'edited\n');
+  fs.writeFileSync(path.join(dir, 'new.txt'), 'new\n');
+  const drift = duet(['verify'], { cwd: dir });
+  assert.equal(drift.code, 1, drift.err);
+  assert.match(drift.out, /edited-after-review.*reviewed\.txt/);
+  assert.match(drift.out, /never-reviewed.*new\.txt/);
+  assert.ok(drift.out.includes(`reply --session ${sid} --responses -`));
+  assert.match(drift.out, /"changes": "<what changed after the approval>", "responses": \[\]/);
+  assert.match(drift.out, /differs from the approved tree: 2 path\(s\)\n$/);
+  assert.equal(git(['ls-files', '--stage'], dir), index);
+  const status = duet(['status', '--session', sid]);
+  assert.equal(status.code, 0, status.err);
+  assert.match(status.out, /differs from the approved tree: 2 path\(s\)\n$/);
+  assert.doesNotMatch(status.out, /edited-after-review|never-reviewed/);
+  const reply = duet(['reply', '--session', sid, '--responses', '-'], {
+    input: responses('Changed after approval.', []), cwd: dir, env: realPolicy,
+  });
+  assert.equal(reply.code, 0, reply.err);
+  assert.equal(state(sid).round, 2);
+  assert.equal(calls().length, 2);
+  assert.match(calls()[1].prompt, /\+edited/);
+  assert.notEqual(state(sid).approval.tree, approved.tree);
+  assert.equal(duet(['verify', '--session', sid]).code, 0);
+});
+
+await test('approval: classification includes deletions, renames by path, mode-only edits and reverts', () => {
+  const dir = approvalRepo();
+  fs.writeFileSync(path.join(dir, 'covered.txt'), 'covered\n');
+  fs.writeFileSync(path.join(dir, 'reviewed.txt'), 'approved\n');
+  fs.rmSync(path.join(dir, 'deleted.txt'));
+  fs.renameSync(path.join(dir, 'rename.txt'), path.join(dir, 'renamed.txt'));
+  fs.chmodSync(path.join(dir, 'mode.sh'), 0o755);
+  const strange = 'space\tline\n.txt';
+  fs.writeFileSync(path.join(dir, strange), 'approved\n');
+  scriptCodex([turn('approve', [], matchingRequest)]);
+  const start = duet(['start', '--kind', 'code'], { cwd: dir, env: realPolicy });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  const same = duet(['verify', '--session', sid]);
+  assert.equal(same.code, 0, same.err);
+  for (const file of ['deleted.txt', 'rename.txt', 'renamed.txt', 'mode.sh']) assert.match(same.out, new RegExp(`covered.*${file}`));
+  fs.writeFileSync(path.join(dir, 'reviewed.txt'), 'base reviewed.txt\n'); // reverting to base is still an edit
+  fs.writeFileSync(path.join(dir, 'deleted.txt'), 'base deleted.txt\n');
+  fs.writeFileSync(path.join(dir, 'untouched.txt'), 'never reviewed\n');
+  fs.rmSync(path.join(dir, 'renamed.txt'));
+  fs.chmodSync(path.join(dir, 'mode.sh'), 0o644);
+  fs.writeFileSync(path.join(dir, strange), 'edited\n');
+  const r = duet(['verify', '--session', sid]);
+  assert.equal(r.code, 1, r.err);
+  for (const file of ['reviewed.txt', 'deleted.txt', 'renamed.txt', 'mode.sh']) assert.match(r.out, new RegExp(`edited-after-review.*${file}`));
+  assert.match(r.out, /never-reviewed.*untouched\.txt/);
+  assert.ok(r.out.includes(JSON.stringify(strange)), r.out);
+  assert.match(r.out, /differs from the approved tree: 6 path\(s\)\n$/);
+});
+
+await test('approval: non-DONE clears code and build approvals, including failed Codex turns', () => {
+  const dir = approvalRepo();
+  fs.writeFileSync(path.join(dir, 'reviewed.txt'), 'approved\n');
+  scriptCodex([turn('approve', [], matchingRequest), { fail: 'network unavailable' }]);
+  const start = duet(['start', '--kind', 'code'], { cwd: dir, env: realPolicy });
+  const sid = sessionId(start.out);
+  const failed = duet(['reply', '--session', sid, '--responses', '-'], { input: responses('another look', []), env: realPolicy });
+  assert.equal(failed.code, 1);
+  assert.equal(state(sid).approval, undefined);
+  assert.equal(duet(['verify', '--session', sid]).code, 1);
+  const build = approvalBuild({ maxRounds: 1 });
+  approveBuild(build.sid);
+  const revise = duet(['review', '--session', build.sid, '--issues', '-'], {
+    input: reviewJSON('revise', [reviewIssue('C1', 'open')]), env: realPolicy,
+  });
+  assert.equal(revise.code, 0, revise.err);
+  assert.equal(state(build.sid).approval, undefined);
+  assert.equal(duet(['finish', '--session', build.sid]).code, 2);
+  assert.equal(duet(['discard', '--session', build.sid]).code, 0);
+});
+
+await test('approval: older sessions without approval verify as unapproved and require the override', () => {
+  const { sid, dir, branch } = approvalBuild();
+  approveBuild(sid);
+  const old = state(sid);
+  delete old.approval;
+  fs.writeFileSync(path.join(home, sid, 'state.json'), JSON.stringify(old));
+  const verify = duet(['verify', '--session', sid]);
+  assert.equal(verify.code, 1, verify.err);
+  assert.match(verify.out, /no approval recorded/);
+  assert.match(duet(['status', '--session', sid]).out, /no approval recorded/);
+  const finish = duet(['finish', '--session', sid]);
+  assert.equal(finish.code, 2);
+  assert.match(finish.err, /finish --unreviewed/);
+  assert.equal(git(['rev-parse', branch], dir).trim(), old.subject.base);
+  assert.equal(duet(['finish', '--session', sid, '--unreviewed'], { env: gitIdentity }).code, 0);
+  const codeDir = approvalRepo();
+  fs.writeFileSync(path.join(codeDir, 'reviewed.txt'), 'review me\n');
+  scriptCodex([turn('approve', [])]);
+  const start = duet(['start', '--kind', 'code'], { cwd: codeDir });
+  const codeId = sessionId(start.out);
+  const oldCode = state(codeId);
+  delete oldCode.approval;
+  fs.writeFileSync(path.join(home, codeId, 'state.json'), JSON.stringify(oldCode));
+  const codeVerify = duet(['verify', '--session', codeId]);
+  assert.equal(codeVerify.code, 1, codeVerify.err);
+  assert.match(codeVerify.out, /no approval recorded/);
+});
+
+await test('approval: verify explains its scope for plan and file reviews', () => {
+  for (const kind of ['plan', 'file']) {
+    fs.writeFileSync(path.join(tmp, 'verify.md'), 'review\n');
+    scriptCodex([turn('approve', [])]);
+    const start = duet(['start', '--kind', kind, '--subject', 'verify.md'], { cwd: tmp });
+    const sid = sessionId(start.out);
+    const r = duet(['verify', '--session', sid]);
+    assert.equal(r.code, 2);
+    assert.match(r.err, /code and build sessions/);
+    assert.equal(state(sid).approval, undefined);
+  }
+});
 
 await test('brief stdin: stored verbatim and passed inside owner_brief, with focus retained', () => {
   scriptCodex([turn('approve', [], matchingRequest)]);

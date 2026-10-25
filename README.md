@@ -8,6 +8,8 @@ It also works the other way around: in **build** mode, Codex writes the code whi
 
 To keep the work tied to your own words, reviews can take `start --brief <file|->`: a Markdown brief with `## Owner's request` (verbatim, required), `## Accepted amendments` (only changes you accepted, with sources), and `## Claimed result` (the author's claim). Build specs require the first section and may include amendments; they use no separate `--brief`, and audit takes no brief. Codex and, before approving a build, Claude independently report `request_check`; a reported narrowing in a review or a build disagreement escalates to you. Summaries, `status`, and the report show the checks.
 
+Approval is tied to the reviewed tree. In a build, `finish` checks both the worktree and the commit after hooks; changed content comes back as a new review round with no commit left on the branch. `finish --unreviewed` bypasses these checks only on your explicit word and records the choice in the commit and report. Before manually committing a code review, run `verify`; if the content differs, use the printed `reply` command to send it back to Codex. Paths are labeled `covered`, `edited-after-review`, or `never-reviewed`.
+
 ## Installation
 
 You need:

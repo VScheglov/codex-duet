@@ -53,7 +53,9 @@ const USAGE = `Usage: duet.mjs <command> [options]
           reports findings with evidence: one turn, nothing to answer, the report is the result
   reply   --responses <file>|- [--session <id>] [--max-rounds <n>]     (review sessions)
   review  --issues <file>|- [--session <id>] [--max-rounds <n>]        (build sessions)
-  finish  [--session <id>]     build: commit the worktree on its branch and remove the worktree
+  finish  [--session <id>] [--unreviewed]   build: commit only approved content and remove the worktree
+          --unreviewed: only on the owner's explicit word, commit without an approval check
+  verify  [--session <id>]     code/build: compare current content with the approved tree (foreground)
   discard [--session <id>]     build: remove the worktree and delete its branch
   retry   [--session <id>] [--fresh]   re-run a Codex round that failed; a turn Codex had begun goes on
           in its own thread, with what it did and read; --fresh starts the turn over
@@ -71,7 +73,7 @@ class UsageError extends Error {}
 
 // ---------------------------------------------------------------- CLI
 
-const BOOLEAN_FLAGS = new Set(['all', 'fresh']);
+const BOOLEAN_FLAGS = new Set(['all', 'fresh', 'unreviewed']);
 const cliError = (message) => Object.assign(new UsageError(message), { showUsage: true });
 
 function parseArgs(argv) {
@@ -556,6 +558,58 @@ function takeSnapshot(st, round) {
       return { path: file, snap, exists };
     }),
   };
+}
+
+// All comparisons use immutable tree objects, including modes and deletions. Renames
+// count by path; -z keeps tabs, newlines and git's path quoting out of the classifier.
+function pathStates(st, approved, current) {
+  const cwd = st.kind === 'build' ? st.subject.repo : st.cwd;
+  const changed = (from, to) => new Set(git([
+    'diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z', from, to, '--',
+  ], { cwd }).stdout.split('\0').filter(Boolean));
+  const reviewed = changed(st.subject.base, approved);
+  const edited = changed(approved, current);
+  return [...new Set([...reviewed, ...edited])].sort().map((file) => ({
+    path: file,
+    state: reviewed.has(file) ? (edited.has(file) ? 'edited-after-review' : 'covered') : 'never-reviewed',
+  }));
+}
+
+const pathStateLines = (paths) => paths.map((p) => `- ${p.state}: ${JSON.stringify(p.path)}`);
+
+function compareApproval(st, tree, approval = st.approval) {
+  const paths = pathStates(st, approval?.tree ?? st.subject.base, tree);
+  return { tree, approval, paths, matches: Boolean(approval && approval.tree === tree) };
+}
+
+function currentApprovalCheck(st) {
+  const onBranch = st.kind === 'build' && !fs.existsSync(st.subject.worktree);
+  const tree = onBranch
+    ? git(['rev-parse', '--verify', `${st.subject.branch}^{tree}`], { cwd: st.subject.repo }).stdout.trim()
+    : snapshotTree(st, `check-${process.pid}`);
+  return { ...compareApproval(st, tree), source: onBranch ? `Branch commit (${st.subject.branch})` : 'Working tree' };
+}
+
+function approvalVerdict(check) {
+  if (check.matches) return 'matches the approved tree';
+  const n = check.paths.filter((p) => p.state !== 'covered').length;
+  return `differs from the approved tree: ${n} path(s)${check.approval ? '' : ' (no approval recorded)'}`;
+}
+
+function clearApproval(st) {
+  // Keep the last witness for an explicit unreviewed finish, even after a later
+  // decision or post-approval round invalidated the active approval.
+  if (st.approval) st.lastApproval = st.approval;
+  delete st.approval;
+}
+
+function recordApproval(st) {
+  if (!['code', 'build'].includes(st.kind)) return;
+  if (st.decision.action !== 'done') {
+    clearApproval(st);
+    return;
+  }
+  st.approval = { tree: st.rounds.at(-1).snapshot.tree, round: st.round, at: now() };
 }
 
 function unifiedDiff(before, after, label) {
@@ -1144,7 +1198,7 @@ async function decide(st, reply) {
       d = { action: 'escalate', reason: "the reviewer reports the subject narrows the owner's request", issues: [], enforced: true };
     } else if (st.kind === 'build' && reply.verdict === 'approve'
       && normalizeRequestCheck(last?.request_check, false).status === 'matches'
-      && ['narrowed', 'unclear'].includes(normalizeRequestCheck(last?.author?.request_check, false).status)) {
+      && ['narrowed', 'unclear'].includes(codexRequestCheck(st).status)) {
       d = { action: 'escalate', reason: "Codex and Claude disagree on whether the work delivers the owner's request", issues: [], enforced: true };
     }
   }
@@ -1194,6 +1248,7 @@ function interruptedThread(st) {
 
 // The caller holds the session lock for the whole round.
 async function runRound(st, round, payload) {
+  clearApproval(st);
   const prev = st.rounds.at(-1)?.snapshot ?? null;
   const snap = takeSnapshot(st, round);
   const cutOff = interruptedThread(st);
@@ -1247,6 +1302,7 @@ async function runRound(st, round, payload) {
 async function settle(st, reply) {
   st.decision = await decide(st, reply);
   st.phase = PHASE_BY_ACTION[st.decision.action];
+  recordApproval(st);
   saveState(st);
   if (st.phase !== 'awaiting-author') fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), renderReport(st));
   process.stdout.write(`${renderSummary(st)}\n`);
@@ -1358,6 +1414,7 @@ function issuesForAuthor(st) {
 
 // One implementation turn of Codex. The caller holds the session lock.
 async function runBuildTurn(st, round, review) {
+  clearApproval(st);
   const cutOff = interruptedThread(st);
   const prompt = cutOff
     ? template('resume.md')
@@ -1415,7 +1472,7 @@ async function runBuildTurn(st, round, review) {
   process.stdout.write(`${renderBuildSummary(st)}\n`);
 }
 
-function renderBuildSummary(st) {
+function renderBuildSummary(st, approvalCheck = null) {
   const last = st.rounds.at(-1);
   const { worktree, branch, base } = st.subject;
   const L = [
@@ -1425,7 +1482,8 @@ function renderBuildSummary(st) {
     ...requestCheckLines(st),
   ];
   if (st.phase === 'awaiting-review') {
-    L.push(`Codex: ${indent(last.author.summary)}`, `Tests: ${indent(last.author.tests)}`);
+    L.push(`${last.kind === 'post-approval' ? 'Changes' : 'Codex'}: ${indent(last.author.summary)}`, `Tests: ${indent(last.author.tests)}`);
+    if (last.pathStates) L.push(...pathStateLines(last.pathStates));
     if (last.author.questions.length) L.push('Questions:', ...last.author.questions.map((q) => `- ${indent(q)}`));
     const answers = Object.values(st.issues).filter((i) => i.author?.round === st.round).sort(byPriority);
     if (answers.length) {
@@ -1434,7 +1492,7 @@ function renderBuildSummary(st) {
     }
     const silent = openIssues(st).filter((i) => i.author?.round !== st.round);
     if (silent.length) L.push(`Not answered by Codex: ${silent.map((i) => i.id).join(', ')}`);
-    const prev = st.rounds.at(-2)?.snapshot.tree ?? base;
+    const prev = last.diffBase ?? st.rounds.at(-2)?.snapshot.tree ?? base;
     const diffArgs = ['diff', '--no-color', '--no-ext-diff', '-M'];
     const stat = git([...diffArgs, '--stat=200', base, last.snapshot.tree], { cwd: worktree }).stdout.trim();
     const diff = git([...diffArgs, prev, last.snapshot.tree], { cwd: worktree }).stdout;
@@ -1477,6 +1535,11 @@ function renderBuildSummary(st) {
     }
   }
   if (d?.action === 'done') {
+    L.push('', `Base: ${base}`, `Approved tree: ${st.approval?.tree ?? 'none'}`);
+    if (approvalCheck && !approvalCheck.matches) {
+      L.push('The worktree already differs from the reviewed snapshot; finish will send these paths back for review.',
+        ...pathStateLines(approvalCheck.paths));
+    }
     L.push('', `Ready. Ask the owner, then: node "${SELF}" finish --session ${st.id} (commit on ${branch}, remove the worktree) or discard`);
   }
   L.push('', `Report: ${path.join(sessionDir(st.id), 'report.md')}`);
@@ -1535,15 +1598,17 @@ async function cmdReview(o) {
     if (ruled && st.decision.action === 'escalate' && st.round < st.maxRounds) {
       st.decision = { action: 'continue', reason: 'the owner ruled; Codex acts on it', issues: [], enforced: true };
     }
+    recordApproval(st);
     if (st.decision.action === 'continue') {
       saveState(st);
       await runBuildTurn(st, st.round + 1, review);
       return;
     }
     st.phase = PHASE_BY_ACTION[st.decision.action];
+    const approvalCheck = st.approval ? currentApprovalCheck(st) : null;
     saveState(st);
     fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), renderReport(st));
-    process.stdout.write(`${renderBuildSummary(st)}\n`);
+    process.stdout.write(`${renderBuildSummary(st, approvalCheck)}\n`);
   } finally {
     release();
   }
@@ -1564,6 +1629,33 @@ function specTitle(st) {
 // The runner's commit names itself once: a title that starts with codex-duet already does.
 const commitSubject = (title) => (/^codex-duet\b/i.test(title) ? title : `codex-duet: ${title}`);
 
+function postApprovalRound(st, tree, cause) {
+  const approval = st.approval;
+  const paths = pathStates(st, approval.tree, tree);
+  st.round += 1;
+  st.rounds.push({
+    n: st.round,
+    kind: 'post-approval',
+    cause,
+    author: { summary: `Changed after the approval, not by Codex. ${cause}`, tests: 'No Codex turn in this round.', questions: [] },
+    snapshot: { tree },
+    diffBase: approval.tree,
+    pathStates: paths,
+    startedAt: now(),
+    finishedAt: now(),
+    verdict: null,
+    summary: '',
+    open: openIssues(st).length,
+    parked: parkedIssues(st).length,
+  });
+  clearApproval(st);
+  st.decision = null;
+  st.phase = 'awaiting-review';
+  saveState(st);
+  fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), renderReport(st));
+  process.stdout.write(`Nothing was committed; ${cause} The content is back for review.\n${renderBuildSummary(st)}\n`);
+}
+
 async function cmdFinish(o) {
   const { id } = resolveSession(o.session);
   const release = acquireLock(id);
@@ -1573,18 +1665,54 @@ async function cmdFinish(o) {
     guardIdle(st);
     const { repo, worktree, branch, base } = st.subject;
     if (!fs.existsSync(worktree)) throw new UsageError(`the worktree is gone already (phase: ${st.phase})`);
-    git(['add', '-A'], { cwd: worktree });
-    if (git(['diff', '--cached', '--quiet'], { cwd: worktree, allowFail: true }).status !== 0) {
-      git(['commit', '-q', '-m', commitSubject(specTitle(st)), '-m',
-        `Implemented by Codex, reviewed by Claude in ${st.round} round(s); session ${st.id}.`], { cwd: worktree });
+    if (!st.approval && !o.unreviewed) {
+      throw new UsageError('the content was not approved; the owner can finish anyway with finish --unreviewed');
+    }
+    const current = snapshotTree(st, `finish-${process.pid}`);
+    if (!o.unreviewed && current !== st.approval.tree) {
+      postApprovalRound(st, current, 'The worktree changed after the approval.');
+      return;
+    }
+    const finish = { unreviewed: Boolean(o.unreviewed), round: st.round, phase: st.phase, at: now() };
+    const unreviewedNote = `Owner finished without an approval (round ${st.round}, phase ${st.phase}); session ${st.id}.`;
+    const previousHead = git(['rev-parse', 'HEAD'], { cwd: worktree }).stdout.trim();
+    // A rejected commit leaves the session and the user's staging as they were.
+    const index = path.resolve(worktree, git(['rev-parse', '--git-path', 'index'], { cwd: worktree }).stdout.trim());
+    const indexBefore = fs.existsSync(index) ? { data: fs.readFileSync(index), stat: fs.statSync(index) } : null;
+    try {
+      git(['add', '-A'], { cwd: worktree });
+      if (git(['diff', '--cached', '--quiet'], { cwd: worktree, allowFail: true }).status !== 0) {
+        git(['commit', '-q', '-m', commitSubject(specTitle(st)), '-m', o.unreviewed ? unreviewedNote
+          : `Implemented by Codex, reviewed by Claude in ${st.round} round(s); session ${st.id}.`], { cwd: worktree });
+      }
+    } catch (err) {
+      if (indexBefore) {
+        fs.writeFileSync(index, indexBefore.data);
+        fs.utimesSync(index, indexBefore.stat.atime, indexBefore.stat.mtime);
+      } else fs.rmSync(index, { force: true });
+      throw err;
     }
     const head = git(['rev-parse', 'HEAD'], { cwd: worktree }).stdout.trim();
+    const committedTree = git(['rev-parse', 'HEAD^{tree}'], { cwd: worktree }).stdout.trim();
+    if (!o.unreviewed && committedTree !== st.approval.tree) {
+      git(['reset', '--soft', previousHead], { cwd: worktree });
+      postApprovalRound(st, snapshotTree(st, `hooks-${process.pid}`), 'Commit hooks changed the approved content; their commit was undone.');
+      return;
+    }
+    if (o.unreviewed) {
+      const lastApproval = st.approval ?? st.lastApproval;
+      finish.approvedTree = lastApproval?.tree ?? null;
+      finish.pathStates = compareApproval(st, committedTree, lastApproval).paths;
+    }
     removeWorktree(st, { deleteBranch: false });
-    Object.assign(st.subject, { commit: head });
+    Object.assign(st.subject, { commit: head, committedTree });
+    st.finish = finish;
     st.phase = 'finished';
     saveState(st);
+    fs.writeFileSync(path.join(sessionDir(st.id), 'report.md'), renderReport(st));
     console.log([
       `codex-duet ${st.id}: ${branch} is at ${head.slice(0, 10)}; the worktree is removed.`,
+      ...approvalReportLines(st),
       `Look:  git -C "${repo}" log --stat ${base.slice(0, 10)}..${branch}`,
       `Merge: git -C "${repo}" merge ${branch}`,
       `Drop:  git -C "${repo}" branch -D ${branch}`,
@@ -1817,7 +1945,7 @@ const requestRulingLine = (st) => st.requestRuling
   : '(none recorded)';
 
 function codexRequestCheck(st) {
-  const last = st.rounds.at(-1);
+  const last = st.kind === 'build' ? st.rounds.findLast((r) => r.kind !== 'post-approval') : st.rounds.at(-1);
   return normalizeRequestCheck(st.kind === 'build' ? last?.author?.request_check : last?.request_check, st.kind !== 'build');
 }
 
@@ -1901,6 +2029,7 @@ function renderReport(st) {
     `- Rounds: ${st.round}/${st.maxRounds}`,
     `- Outcome: ${st.decision?.action ?? st.phase} — ${st.decision?.reason ?? ''}`,
     `- Codex thread: ${st.codex.threadId} (continue it in Codex: codex resume ${st.codex.threadId})`,
+    ...approvalReportLines(st).map((line) => line.startsWith('- ') ? line : `- ${line}`),
     '',
     "## Owner's request",
     '',
@@ -1924,7 +2053,36 @@ function renderReport(st) {
       if (text) L.push(`- r${h.round} ${h.by}${h.action ? ` (${h.action})` : ''}${h.status ? ` → ${h.status}` : ''}: ${indent(text, '  ')}`);
     }
   }
+  if (['code', 'build'].includes(st.kind)) {
+    L.push('', '## Round history');
+    for (const r of st.rounds) {
+      L.push('', `### Round ${r.n}${r.kind === 'post-approval' ? ' · post-approval' : ''}`);
+      if (r.author) L.push(`${r.kind === 'post-approval' ? 'Changes' : 'Codex'}: ${r.author.summary}`, `Tests: ${r.author.tests}`);
+      if (r.snapshot?.tree) L.push(`Snapshot tree: ${r.snapshot.tree}`);
+      if (r.diffBase) L.push(`This round: ${r.diffBase} → ${r.snapshot.tree}`);
+      if (r.pathStates) L.push(...pathStateLines(r.pathStates));
+      if (r.verdict) L.push(`${st.kind === 'build' ? 'Claude' : 'Codex'}: ${r.verdict} — ${r.summary}`);
+    }
+  }
   return `${L.join('\n')}\n`;
+}
+
+function approvalReportLines(st) {
+  if (!['code', 'build'].includes(st.kind)) return [];
+  const L = [`Base: ${st.subject.base}`, `Approved tree: ${st.approval?.tree ?? 'none'}`];
+  if (st.subject.committedTree) {
+    L.push(`Committed tree: ${st.subject.committedTree}`);
+    if (st.approval) L.push(`Approved and committed trees are ${st.approval.tree === st.subject.committedTree ? 'equal' : 'not equal'}.`);
+  }
+  if (st.finish) {
+    L.push(st.finish.unreviewed
+      ? `Owner finished without an approval (round ${st.finish.round}, phase ${st.finish.phase}).`
+      : 'Owner finished unreviewed: no.');
+    if (st.finish.unreviewed) {
+      L.push(`Last approved tree: ${st.finish.approvedTree ?? 'none'}`, ...pathStateLines(st.finish.pathStates));
+    }
+  }
+  return L;
 }
 
 // ---------------------------------------------------------------- commands
@@ -2115,6 +2273,32 @@ function cmdStatus(o) {
   if (st.rounds.length) {
     console.log(st.kind === 'build' ? renderBuildSummary(st) : st.kind === 'audit' ? renderAuditSummary(st) : renderSummary(st));
   }
+  if (st.phase === 'done' && ['code', 'build'].includes(st.kind)) console.log(approvalVerdict(currentApprovalCheck(st)));
+}
+
+function cmdVerify(o) {
+  const { id } = resolveSession(o.session);
+  const release = acquireLock(id);
+  try {
+    const st = loadState(id);
+    if (!['code', 'build'].includes(st.kind)) throw new UsageError('verify applies to code and build sessions');
+    const check = currentApprovalCheck(st);
+    const L = [
+      `Approved tree: ${st.approval?.tree ?? 'no approval recorded'}`,
+      `${check.source}: ${check.tree}`,
+      ...pathStateLines(check.paths),
+    ];
+    if (!check.matches && st.kind === 'code') {
+      L.push('Send the changes back to Codex:', '```bash',
+        `node "${SELF}" reply --session ${st.id} --responses - <<'DUET_JSON'`,
+        '{"changes": "<what changed after the approval>", "responses": []}', 'DUET_JSON', '```');
+    }
+    L.push(approvalVerdict(check));
+    console.log(L.join('\n'));
+    if (!check.matches) process.exitCode = 1;
+  } finally {
+    release();
+  }
 }
 
 function cmdReport(o) {
@@ -2144,6 +2328,7 @@ const COMMANDS = {
   list: cmdList,
   review: cmdReview,
   finish: cmdFinish,
+  verify: cmdVerify,
   discard: cmdDiscard,
   help: () => console.log(USAGE),
 };

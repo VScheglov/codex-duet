@@ -8,6 +8,8 @@
 
 为了按你的原话核对工作，审查可使用 `start --brief <file|->` 传入 Markdown，包含 `## Owner's request`（原话，必填）、`## Accepted amendments`（仅限你已接受的修改，并注明来源）和 `## Claimed result`（作者声称达到的结果）。build 的规格本身必须包含第一个章节，可包含已接受的修改；不使用单独的 `--brief`，audit 也不接受 brief。Codex 和批准 build 前的 Claude 分别填写 `request_check`；审查报告需求被缩减，或 build 中双方判断不一致时，会交给你裁决。轮次摘要、`status` 和报告都会显示检查结果。
 
+批准与已审查的 Git 树绑定。build 中的 `finish` 会核对 worktree 和钩子运行后的提交；内容有变时会作为新一轮审查返回，分支上不保留该提交。只有你明确要求时才能使用 `finish --unreviewed` 跳过检查，提交信息和报告会记录这一选择。code 审查后手动提交前，先运行 `verify`；内容有变时，使用输出中的 `reply` 命令交回 Codex 复审。路径标记为 `covered`、`edited-after-review` 或 `never-reviewed`。
+
 ## 安装
 
 需要：

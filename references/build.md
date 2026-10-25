@@ -93,7 +93,8 @@ Use `matches` when the owner settles that the request is met, or `narrowed-accep
 
 After `DONE` (or whenever the user decides to stop), present the result and ask:
 
-- `finish --session <id>` commits the worktree on its branch with the spec title as the subject and removes the worktree; the summary prints how to look at, merge or drop the branch.
+- `finish --session <id>` commits only the approved content on its branch with the spec title as the subject and removes the worktree; the summary prints how to look at, merge or drop the branch. It compares the worktree and the resulting commit tree with the approved snapshot. Drift, including content changed by commit hooks, leaves no commit on the branch and returns the changes as a new review round: continue with the printed `review` command. The paths are labeled `covered`, `edited-after-review`, or `never-reviewed`.
+- Without an approval, finish refuses. Use `finish --unreviewed --session <id>` only on the owner's explicit word to commit the current content anyway; the commit body and report record the round and phase. `verify --session <id>` checks the worktree against the approval without finishing (or checks the branch commit after the worktree is removed).
 - `discard --session <id>` removes the worktree and deletes the branch.
 
 Both change the user's repository: run them only after the user agrees.

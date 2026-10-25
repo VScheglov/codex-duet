@@ -74,5 +74,7 @@ For a request-check escalation, present the reviewer's notes and the decision ne
 ## Recovery
 
 - After context compaction or in a new conversation: `status` re-prints the current state and the next command.
+- Before Claude or the owner manually commits reviewed code, run `verify --session <id>` in the foreground. It checks the working tree against the approved snapshot, labels paths `covered`, `edited-after-review`, or `never-reviewed`, and exits 0 only when they match. If they differ, use the printed `reply --session <id> --responses -` command with `{"changes": "<what changed after the approval>", "responses": []}` to have Codex review the current content again. `status` also shows a one-line verdict for a done code or build session.
+- In a build, `finish` commits only approved content; worktree or commit-hook drift returns as a review round with no commit left on the branch. `finish --unreviewed` bypasses the checks only on the owner's explicit word and records that decision in the commit and report.
 - A round failed (network, timeout, expired login): fix the cause (for example `codex login`), then `retry`.
 - To see the reviewer's full reasoning, open the thread in Codex: `codex resume <thread id>` (the id is in the report).

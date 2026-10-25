@@ -130,6 +130,8 @@ export const ru: Locale = {
   taskCounts: (running: number, queued: number, total: number) => `Задачи · идут ${running} · в очереди ${queued} · всего ${total}`,
   parkedForOwner: 'отложено для владельца',
   disputes: (n: number) => `споров: ${n}`,
+  quoteMissing: 'цитата не найдена',
+  quoteOtherFile: 'цитата в другом файле',
   issueCounts: (open: number, parked: number, closed: number) => `Замечания · открыто ${open} · отложено ${parked} · закрыто ${closed}`,
   closedIssues: (shown: boolean, n: number) => `${shown ? '▾' : '▸'} закрытые · ${n}`,
   paneHeading: (kind: string, round: number, max: number) => `codex-duet · ${kind} · раунд ${round}/${max}`,

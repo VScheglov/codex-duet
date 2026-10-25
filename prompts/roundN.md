@@ -1,5 +1,5 @@
 <round number="{{ROUND}}">
-The author has answered your issues and may have changed the subject. Verify against the CURRENT state on disk and in git, not against your memory of earlier rounds.
+The author has answered your issues and may have changed the subject. Verify against this round's CURRENT snapshot, not against your memory of earlier rounds.
 </round>
 
 <subject>
@@ -43,5 +43,11 @@ Also:
 - Include gaps for parts not examined, or examined only partly. Both checks and gaps are required; use [] when none.
 - verdict and summary as in the first round. Return only JSON that matches the provided schema.
 </rules_for_this_round>
+
+<output_contract>
+- path: file relative to the repository root for code, or as listed in the subject for plan/file; "" when the issue is not about one file.
+- line: the 1-based line of the quote in that file as of this round's reviewed snapshot; 0 when unknown.
+- quote: for new or re-cited open issues, one to three lines copied verbatim from the file as of this snapshot, not from the diff's + lines unless the + is file content; "" when there is nothing to quote (something missing). When closing an issue, you may repeat its earlier citation or use "". For open issues, the runner checks new or changed citations (quote or path) against this snapshot. Closing replies and unchanged or absent citations retain the earlier check.
+</output_contract>
 
 {{SUBJECT_BODY}}

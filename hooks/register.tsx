@@ -388,6 +388,7 @@ function buildView(st: any, now: number, live: Liveness | null, digest: Digest |
       lastAction: i.author?.action ?? null,
       codexReply: oneLine(i.codexReply || i.body),
       authorNote: oneLine(i.author?.note),
+      quoteCheck: i.quoteCheck,
     }))
     .sort((a, b) => Number(b.status === 'open') - Number(a.status === 'open')
       || (SEVERITY_RANK[b.severity] ?? 0) - (SEVERITY_RANK[a.severity] ?? 0)
@@ -1110,6 +1111,8 @@ export const register: Register = (on, options) => {
       const shown = isOpen(key)
       const isDone = issue.status !== 'open'
       const answer = issue.lastAction ? ` (${actionLabel(issue.lastAction)})` : ''
+      const quote = isDone ? '' : issue.quoteCheck?.mark === 'MISSING' ? locale.quoteMissing
+        : issue.quoteCheck?.mark.startsWith('other_file:') ? locale.quoteOtherFile : ''
       const said = [
         issue.codexReply ? `${view.roles.reviewer}: ${issue.codexReply}` : '',
         issue.lastAction || issue.authorNote ? `${view.roles.author}${answer}: ${issue.authorNote || '—'}` : '',
@@ -1122,7 +1125,7 @@ export const register: Register = (on, options) => {
             {fold(key, shown)}
             {badge(statusMark(issue), issue.id, issue.severity, isDone)}
             <Box flexShrink={1} flexGrow={1}>
-              <Text dimColor={isDone} wrap="wrap">{`${issue.disputes ? `⚔×${issue.disputes} ` : ''}${issue.title}`}</Text>
+              <Text dimColor={isDone} wrap="wrap">{`${issue.disputes ? `⚔×${issue.disputes} ` : ''}${issue.title}${quote ? ` · ${quote}` : ''}`}</Text>
             </Box>
           </Box>
           {shown ? (

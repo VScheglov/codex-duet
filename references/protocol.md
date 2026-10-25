@@ -25,6 +25,22 @@ Issues whose titles start with `Request: ` identify something dropped, narrowed 
 
 The summary's `Verification:` receipt confirms Codex's claimed checks against the round's saved command events and lists failures, skips with reasons, unconfirmed or contradicted claims, and gaps. `executed` means all checks confirmed with no skips or gaps (including confirmed failures); `partial` means some confirmed with incomplete coverage; `static-analysis-only` means none confirmed; older replies are `unknown`. The label appears beside DONE, in `report.md` and in `/duet`; it never changes the stop decision. Present it to the owner, and explain the limits whenever it is not `executed`.
 
+## Quote checks
+
+Each issue has a separate `path`, `line` and `quote`. Before recording a review, the runner checks new or changed citations on open issues against that round's immutable snapshot: the tree object for code/build, or saved subject-file copies for plan/file. Plan/file paths may be as listed, relative to the session cwd, or absolute; an empty path selects the only subject file. It searches up to three longest distinct trimmed quote lines of at least 12 characters, falling back to the whole trimmed quote at 6 characters. A leading diff marker is stripped once if the original needle is not found.
+
+| Mark | Meaning |
+|---|---|
+| `ok` | A needle occurs in the cited file within 3 lines of `line`, or anywhere when `line` is 0. |
+| `moved:<L>` | A needle occurs in the cited file farther away; L is the first hit. |
+| `other_file:<F>` | No needle occurs in the cited file, but one occurs in snapshot file F. |
+| `MISSING` | No needle occurs anywhere in the readable snapshot. |
+| `unchecked` | No quote, no usable path or needle, an unreadable snapshot/file, or a binary cited file. |
+
+Summaries and author prompts show moved, other-file and missing citations; subsequent reviewer prompts also show `unchecked`. The report keeps every mark and its round; the pane flags missing and other-file citations only on open issues. An existing open issue is checked again only when it carries a nonempty quote and its quote or path changes; changing only the line does not trigger a check. Replies that resolve or withdraw an issue, and replies with unchanged or absent quotes, keep the earlier citation and check. This preserves evidence of the original problem after a fix removes the quoted code. Older issues without a check remain unchecked until re-cited while open.
+
+`MISSING` is a reason to ask Codex to re-cite, not proof that the issue is wrong. Inspect the evidence before using a mark in a dispute. A mark never resolves, withdraws or parks an issue and never changes the stop decision; every open issue still needs an answer.
+
 ## Actions
 
 | action | meaning | what Codex does next |

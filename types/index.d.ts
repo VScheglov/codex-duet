@@ -15,6 +15,7 @@ export type DuetIssue = {
   lastAction: string | null
   codexReply: string
   authorNote: string
+  quoteCheck?: { mark: string; round: number; path?: string; tree?: string }
 }
 
 export type DuetRound = { n: number; verdict: string; seconds: number; open: number; tokens: number }

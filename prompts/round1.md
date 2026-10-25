@@ -45,6 +45,9 @@ Skip style, naming and formatting unless they cause real misunderstanding. One s
 - Number issues C1, C2, ... in order. Ids are permanent: never reuse or renumber them in later rounds.
 - severity: critical = data loss, security hole, core behavior broken; high = likely bug or wrong approach; medium = real but contained problem; low = minor, safe to ship as is.
 - location: "path:start-end" for code, the step or section for plans and documents, "" if not applicable.
+- path: file relative to the repository root for code, or as listed in the subject for plan/file; "" when the issue is not about one file.
+- line: the 1-based line of the quote in that file as of the reviewed snapshot; 0 when unknown.
+- quote: one to three lines copied verbatim from the file as of the snapshot, not from the diff's + lines unless the + is file content; "" when there is nothing to quote (something missing). The runner checks each quote against the snapshot.
 - In this first round every issue has status "open" and reply "".
 - verdict: "approve" if nothing remains that you would block on; otherwise "revise".
 - summary: 1-3 sentences, a terse ship / no-ship assessment.

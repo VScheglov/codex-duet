@@ -54,9 +54,11 @@ node "<base>/scripts/duet.mjs" review --session <id> --issues - <<'DUET_JSON'
   {"id": "C1", "status": "open", "severity": "high", "title": "Request: parse('') throws TypeError",
    "body": "parse.js:12 indexes the first token without a length check; node -e \"require('./parse')('')\" throws.",
    "location": "parse.js:12", "recommendation": "Return [] for empty input and add a test.",
-   "confidence": 0.9, "reply": "", "owner": false},
+   "confidence": 0.9, "reply": "", "owner": false,
+   "path": "parse.js", "line": 12, "quote": "return tokens[0].value;"},
   {"id": "C2", "status": "resolved", "severity": "medium", "title": "Missing README section",
-   "body": "", "location": "", "recommendation": "", "confidence": 0.9, "reply": "Verified.", "owner": false}
+   "body": "", "location": "", "recommendation": "", "confidence": 0.9, "reply": "Verified.", "owner": false,
+   "path": "README.md", "line": 0, "quote": ""}
  ]}
 DUET_JSON
 ```
@@ -65,6 +67,7 @@ DUET_JSON
 - `request_check`: `{"status": "matches|narrowed|unclear", "notes": "…"}`. `matches` means every owner requirement and accepted amendment is delivered as far as you verified; `narrowed` means something is dropped, narrowed or contradicted (quote each gap); `unclear` means you cannot tell (say why and what would settle it). An `approve` without a valid check, or with `narrowed`, is refused: raise an issue instead. The field is optional for `revise`; `no-brief` is for review kinds only.
 - Without an owner request ruling, if Codex reports `narrowed` or `unclear` while you approve with `matches`, the runner enforces `ESCALATE` and shows both checks for the owner. Both `matches` allow `DONE` under the normal stop rules. Summaries, `status` and the report show the checks; the report also records the spec's path as the owner brief.
 - Ids are permanent: new issues take the next free number; never reuse one.
+- Include `path` relative to the repository root, `line` (1-based in the reviewed snapshot, or 0 when unknown), and `quote` (one to three verbatim file lines, without diff markers unless they are file content; `""` for something missing). The runner checks new or changed citations on open issues against the snapshot of the round you reviewed, including a post-approval round. Closing replies and unchanged citations retain their earlier check. Older review JSON without these fields remains accepted; see [protocol.md](protocol.md) for the marks.
 - For an issue Codex answered: `resolved` (the fix holds; check it), `withdrawn` (its dispute convinces you), or `open` with `reply` saying exactly what is still wrong. Do not repeat yourself: bring new evidence or withdraw.
 - Issues Codex parked (`needs-user`) stay open until the user decides.
 

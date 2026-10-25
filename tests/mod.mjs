@@ -644,6 +644,28 @@ async function languageEngine(options, localeEnv = {}, defaultsResult) {
   return { engine, sid, write };
 }
 
+for (const [language, missing, other] of [
+  ['en', 'quote missing', 'quote in another file'],
+  ['ru', 'цитата не найдена', 'цитата в другом файле'],
+  ['zh', '未找到引文', '引文在其他文件中'],
+]) {
+  await test(`${language}: the board marks only open MISSING and other_file citations`, async () => {
+    const { engine, write } = await languageEngine({ language });
+    const citations = ['MISSING', 'other_file:elsewhere.js', 'ok', 'moved:88', 'unchecked', null, 'MISSING', 'other_file:elsewhere.js', 'ok'];
+    write({ issues: Object.fromEntries(citations.map((mark, n) => {
+      const iid = `C${n + 1}`;
+      return [iid, { ...issue(iid, n === 7 ? 'withdrawn' : n >= 6 ? 'resolved' : 'open'), ...(mark ? { quoteCheck: { mark, round: 1 } } : {}) }];
+    })) });
+    await engine.tick();
+    await engine.press(await engine.render('Pane'), 'fold-closed');
+    const pane = lines(await engine.render('Pane'));
+    assert.ok(pane.includes(`Issue C1 · ${missing}`), pane.join('\n'));
+    assert.ok(pane.includes(`Issue C2 · ${other}`), pane.join('\n'));
+    for (const iid of ['C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9']) assert.ok(pane.includes(`Issue ${iid}`), pane.join('\n'));
+    assert.equal(pane.filter((line) => line.includes(missing) || line.includes(other)).length, 2);
+  });
+}
+
 for (const [language, done, labels, skipped, failed, gaps] of [
   ['en', '✅ done · verification: ', ['executed', 'partial', 'static-analysis-only', 'unknown'], 'skipped', 'failed', 'Not examined fully: '],
   ['ru', '✅ готово · проверка: ', ['выполнена', 'частичная', 'только статический анализ', 'неизвестно'], 'пропущено', 'упало', 'Проверено не полностью: '],

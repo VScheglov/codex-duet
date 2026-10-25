@@ -10,6 +10,8 @@ To keep the work tied to your own words, reviews can take `start --brief <file|-
 
 Approval is tied to the reviewed tree. In a build, `finish` checks both the worktree and the commit after hooks; changed content comes back as a new review round with no commit left on the branch. `finish --unreviewed` bypasses these checks only on your explicit word and records the choice in the commit and report. Before manually committing a code review, run `verify`; if the content differs, use the printed `reply` command to send it back to Codex. Paths are labeled `covered`, `edited-after-review`, or `never-reviewed`.
 
+New or changed citations on open issues are checked against the reviewed snapshot before a round is recorded: `ok`, `moved:<L>`, `other_file:<F>`, `MISSING`, or `unchecked`. Closing replies and unchanged citations keep the earlier check. Summaries and prompts show citation problems, the report keeps the marks, and `/duet` flags missing or other-file quotes only on open issues. A mark never closes an issue or changes the stop decision; `MISSING` calls for a fresh citation, not automatic dismissal.
+
 ## Installation
 
 You need:

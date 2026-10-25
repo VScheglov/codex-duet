@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { confirmVerification, unknownVerification, verificationClaims, verificationLines } from './verification.mjs';
+import { checkQuotes, quoteCheckLine, recitesQuote } from './quotes.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(SELF), '..');
@@ -556,7 +557,7 @@ function takeSnapshot(st, round) {
       const exists = fs.existsSync(file);
       const snap = path.join(dir, `${i}${path.extname(file) || '.txt'}`);
       fs.writeFileSync(snap, exists ? fs.readFileSync(file) : '');
-      return { path: file, snap, exists };
+      return { path: file, snap, exists, listed: st.subject.listedPaths?.[i] ?? file };
     }),
   };
 }
@@ -722,7 +723,8 @@ function buildPrompt(st, round, snap, prev, payload) {
   }
   const responses = payload.responses.map((r) => {
     const issue = st.issues[r.id];
-    return `- ${r.id} [${issue.severity}] ${issue.title}\n  action: ${r.action}\n  note: ${indent(r.note, '  ')}`;
+    const quote = quoteCheckLine(issue, { includeUnchecked: true });
+    return `- ${r.id} [${issue.severity}] ${issue.title}\n  action: ${r.action}\n  note: ${indent(r.note, '  ')}${quote ? `\n  ${quote}` : ''}`;
   });
   return fill(template('roundN.md'), {
     ROUND: round,
@@ -1009,6 +1011,9 @@ function normalizeReply(raw) {
       confidence: Number.isFinite(it.confidence) ? it.confidence : null,
       reply: String(it.reply || '').trim(),
       owner: it.owner === true, // build mode: the reviewer relays the owner's final ruling
+      path: typeof it.path === 'string' ? it.path : '',
+      line: Number.isInteger(it.line) && it.line >= 0 ? it.line : 0,
+      quote: typeof it.quote === 'string' ? it.quote : '',
     });
   }
   return {
@@ -1089,7 +1094,11 @@ function mergeReply(st, reply, round) {
         closedRound: null,
         author: null,
         codexReply: '',
-        history: [{ round, by: reviewerOf(st), status: 'open' }],
+        path: it.path,
+        line: it.line,
+        quote: it.quote,
+        quoteCheck: it.quoteCheck,
+        history: [{ round, by: reviewerOf(st), status: 'open', quoteCheck: it.quoteCheck }],
       };
       added.push(it.id);
       continue;
@@ -1127,8 +1136,10 @@ function mergeReply(st, reply, round) {
       recommendation: it.recommendation || issue.recommendation,
       confidence: it.confidence ?? issue.confidence,
       codexReply: it.reply,
+      ...(recitesQuote(it, issue) ? { path: it.path, line: it.line, quote: it.quote } : {}),
+      quoteCheck: it.quoteCheck,
     });
-    issue.history.push({ round, by: reviewerOf(st), status, reply: it.reply });
+    issue.history.push({ round, by: reviewerOf(st), status, reply: it.reply, quoteCheck: it.quoteCheck });
   }
   for (const issue of Object.values(st.issues)) {
     if (seen.has(issue.id) || issue.status !== 'open' || issue.openedRound >= round) continue;
@@ -1279,6 +1290,7 @@ async function runRound(st, round, payload) {
   if (problem) failTurn(st, round, problem, res);
 
   if (round === 1) st.codex.threadId = res.threadId;
+  const quoteChecks = checkQuotes(st, reply, snap, round);
   const delta = mergeReply(st, reply, round);
   st.round = round;
   st.rounds.push({
@@ -1296,6 +1308,7 @@ async function runRound(st, round, payload) {
     closed: delta.closed,
     open: openIssues(st).length,
     parked: parkedIssues(st).length,
+    quoteChecks,
   });
   delete st.pending;
   await settle(st, reply);
@@ -1410,6 +1423,8 @@ function issuesForAuthor(st) {
     lines.push(`- ${i.id} [${i.severity}] ${i.title}${i.location ? ` — ${i.location}` : ''}`);
     if (i.body) lines.push(`  problem: ${indent(i.body, '  ')}`);
     if (i.recommendation) lines.push(`  suggested fix: ${indent(i.recommendation, '  ')}`);
+    const quote = quoteCheckLine(i);
+    if (quote) lines.push(`  ${quote}`);
     // codexReply holds the reviewer's latest reply: Claude's, in build mode
     if (i.codexReply) lines.push(`  ${i.ownerRuled ? 'Owner decision (final)' : 'architect on your last answer'}: ${indent(i.codexReply, '  ')}`);
   }
@@ -1495,10 +1510,18 @@ function renderBuildSummary(st, approvalCheck = null) {
     const answers = Object.values(st.issues).filter((i) => i.author?.round === st.round).sort(byPriority);
     if (answers.length) {
       L.push('', '### Codex on your issues');
-      for (const i of answers) L.push(`- ${i.id} [${i.severity}] ${i.title} → ${i.author.action}: ${indent(i.author.note)}`);
+      for (const i of answers) {
+        L.push(`- ${i.id} [${i.severity}] ${i.title} → ${i.author.action}: ${indent(i.author.note)}`);
+        const quote = quoteCheckLine(i);
+        if (quote) L.push(`  ${quote}`);
+      }
     }
     const silent = openIssues(st).filter((i) => i.author?.round !== st.round);
     if (silent.length) L.push(`Not answered by Codex: ${silent.map((i) => i.id).join(', ')}`);
+    for (const i of silent) {
+      const quote = quoteCheckLine(i);
+      if (quote) L.push(`  ${i.id}: ${quote}`);
+    }
     const prev = last.diffBase ?? st.rounds.at(-2)?.snapshot.tree ?? base;
     const diffArgs = ['diff', '--no-color', '--no-ext-diff', '-M'];
     const stat = git([...diffArgs, '--stat=200', base, last.snapshot.tree], { cwd: worktree }).stdout.trim();
@@ -1515,12 +1538,13 @@ function renderBuildSummary(st, approvalCheck = null) {
       '',
       "Next: read the verification receipt, review (read files in the worktree where needed, run the tests there), independently check the owner's request and accepted amendments in the spec, then run:",
       'Approval requires request_check; if narrowed, raise an issue for each gap instead of approving.',
+      "Include path, line (1-based; 0 if unknown), and a verbatim quote of 1–3 lines; use an empty quote for something missing. New or changed citations on open issues are checked against this round's snapshot. Closing replies may repeat the earlier citation or use an empty quote; closing or unchanged citations keep their earlier check.",
       '```bash',
       `node "${SELF}" review --session ${st.id} --issues - <<'DUET_JSON'`,
       '{"verdict": "approve|revise", "summary": "<one or two sentences>",',
       ' "request_check": {"status": "matches|narrowed|unclear", "notes": "<your independent check>"}, "issues": [',
       '  {"id": "C1", "status": "open|resolved|withdrawn", "severity": "critical|high|medium|low", "title": "…", "body": "…", '
-        + '"location": "path:line", "recommendation": "…", "confidence": 0.8, "reply": "", "owner": false}',
+        + '"location": "path:line", "recommendation": "…", "confidence": 0.8, "reply": "", "owner": false, "path": "path", "line": 0, "quote": "…"}',
       ']}',
       'DUET_JSON',
       '```',
@@ -1533,8 +1557,22 @@ function renderBuildSummary(st, approvalCheck = null) {
   L.push(...verificationLines(codexVerification(st), 'Tests', lastCodexRound(st)?.author?.tests));
   const open = openIssues(st);
   const parked = parkedIssues(st);
-  if (open.length) L.push('', `### Open (${open.length})`, ...open.map((i) => `- ${i.id} [${i.severity}] ${i.title}`));
-  if (parked.length) L.push('', `### Parked for the owner (${parked.length})`, ...parked.map((i) => `- ${i.id} [${i.severity}] ${i.title} — Codex: ${indent(i.author?.note || '')}`));
+  if (open.length) {
+    L.push('', `### Open (${open.length})`);
+    for (const i of open) {
+      L.push(`- ${i.id} [${i.severity}] ${i.title}`);
+      const quote = quoteCheckLine(i);
+      if (quote) L.push(`  ${quote}`);
+    }
+  }
+  if (parked.length) {
+    L.push('', `### Parked for the owner (${parked.length})`);
+    for (const i of parked) {
+      L.push(`- ${i.id} [${i.severity}] ${i.title} — Codex: ${indent(i.author?.note || '')}`);
+      const quote = quoteCheckLine(i);
+      if (quote) L.push(`  ${quote}`);
+    }
+  }
   if (d?.action === 'escalate') {
     L.push('', "### Needs the owner's decision");
     for (const id of d.issues) {
@@ -1592,6 +1630,7 @@ async function cmdReview(o) {
     switchCodex(st, o);
     if (o['max-rounds']) st.maxRounds = toInt(o['max-rounds'], 'max-rounds');
     if (review.request_check.owner === true) recordRequestRuling(st, review.request_check);
+    const quoteChecks = checkQuotes(st, review, st.rounds.at(-1)?.snapshot, st.round);
     mergeReply(st, review, st.round);
     Object.assign(st.rounds.at(-1), {
       verdict: review.verdict,
@@ -1599,6 +1638,7 @@ async function cmdReview(o) {
       request_check: review.request_check,
       open: openIssues(st).length,
       parked: parkedIssues(st).length,
+      quoteChecks,
     });
     st.decision = await decide(st, review);
     // The owner has ruled: Codex gets a turn to act on it, whatever the stall rule thinks of the history.
@@ -1935,6 +1975,8 @@ function renderIssue(issue, round) {
   const lines = [`- **${issue.id}** [${issue.severity}] ${issue.title}${issue.location ? ` — ${issue.location}` : ''}${tags ? ` (${tags})` : ''}`];
   if (issue.body) lines.push(`  Problem: ${indent(issue.body)}`);
   if (issue.recommendation) lines.push(`  Suggested fix: ${indent(issue.recommendation)}`);
+  const quote = quoteCheckLine(issue);
+  if (quote) lines.push(`  ${quote}`);
   if (issue.codexReply && issue.openedRound !== round) lines.push(`  Codex on your last answer: ${indent(issue.codexReply)}`);
   return lines;
 }
@@ -1991,7 +2033,11 @@ function renderSummary(st) {
   ];
   if (closedNow.length) {
     L.push('', `### Closed this round (${closedNow.length})`);
-    for (const i of closedNow) L.push(`- ${i.id} [${i.severity}] ${i.title} → ${i.status}${i.codexReply ? ` — Codex: ${indent(i.codexReply)}` : ''}`);
+    for (const i of closedNow) {
+      L.push(`- ${i.id} [${i.severity}] ${i.title} → ${i.status}${i.codexReply ? ` — Codex: ${indent(i.codexReply)}` : ''}`);
+      const quote = quoteCheckLine(i);
+      if (quote) L.push(`  ${quote}`);
+    }
   }
   if (open.length) {
     L.push('', `### Open (${open.length})`);
@@ -1999,7 +2045,11 @@ function renderSummary(st) {
   }
   if (parked.length) {
     L.push('', `### Parked for the owner (${parked.length})`);
-    for (const i of parked) L.push(`- ${i.id} [${i.severity}] ${i.title} — ${indent(i.author?.note || '')}`);
+    for (const i of parked) {
+      L.push(`- ${i.id} [${i.severity}] ${i.title} — ${indent(i.author?.note || '')}`);
+      const quote = quoteCheckLine(i);
+      if (quote) L.push(`  ${quote}`);
+    }
   }
   if (d.action === 'continue') {
     L.push(
@@ -2059,19 +2109,21 @@ function renderReport(st) {
     '',
     '## Issues',
     '',
-    '| ID | Severity | Title | Outcome | Rounds |',
-    '|---|---|---|---|---|',
-    ...all.map((i) => `| ${i.id} | ${i.severity} | ${cell(i.title)} | ${outcome(i, st)} | ${i.openedRound}–${i.closedRound ?? st.round} |`),
+    '| ID | Severity | Title | Outcome | Rounds | Quote |',
+    '|---|---|---|---|---|---|',
+    ...all.map((i) => `| ${i.id} | ${i.severity} | ${cell(i.title)} | ${outcome(i, st)} | ${i.openedRound}–${i.closedRound ?? st.round} | ${cell(i.quoteCheck?.mark ?? 'unchecked')} |`),
     '',
     '## Details',
   ];
   for (const i of all) {
     L.push('', `### ${i.id} [${i.severity}] ${i.title}`);
     if (i.location) L.push(`Location: ${i.location}`);
+    L.push(quoteCheckLine(i, { includeOk: true, includeUnchecked: true }));
     L.push('', i.body || '(no description)', '');
     for (const h of i.history) {
       const text = h.note || h.reply;
       if (text) L.push(`- r${h.round} ${h.by}${h.action ? ` (${h.action})` : ''}${h.status ? ` → ${h.status}` : ''}: ${indent(text, '  ')}`);
+      if (h.quoteCheck) L.push(`- r${h.round} ${h.by}: ${quoteCheckLine(h, { includeOk: true, includeUnchecked: true })}`);
     }
   }
   if (['code', 'build'].includes(st.kind)) {
@@ -2132,7 +2184,7 @@ async function initDocSubject(st, o, dir) {
       paths.push(fs.realpathSync(file));
     }
   }
-  st.subject = { paths };
+  st.subject = { paths, listedPaths: [...o.subject] };
 }
 
 function initCodeSubject(st, o) {

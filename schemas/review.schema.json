@@ -47,7 +47,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "status", "severity", "title", "body", "location", "recommendation", "confidence", "reply"],
+        "required": ["id", "status", "severity", "title", "body", "location", "recommendation", "confidence", "reply", "path", "line", "quote"],
         "properties": {
           "id": {
             "type": "string",
@@ -67,7 +67,10 @@
           "location": { "type": "string", "description": "path:start-end, plan step or document section; empty if not applicable." },
           "recommendation": { "type": "string", "description": "A concrete fix." },
           "confidence": { "type": "number", "description": "0..1, how sure you are that the issue is real." },
-          "reply": { "type": "string", "description": "Your answer to the author's latest response on this issue; empty in round 1 and for new issues." }
+          "reply": { "type": "string", "description": "Your answer to the author's latest response on this issue; empty in round 1 and for new issues." },
+          "path": { "type": "string", "description": "File relative to the repository root (code/build) or as listed in the subject (plan/file); empty when the issue is not about one file." },
+          "line": { "type": "integer", "description": "1-based line of the quote in the reviewed snapshot; 0 when unknown, never negative." },
+          "quote": { "type": "string", "description": "One to three lines copied verbatim from the file as of the reviewed snapshot, not diff markers unless they are file content; empty for something missing. New or changed citations on open issues are checked against the snapshot; closing replies keep the earlier check." }
         }
       }
     }

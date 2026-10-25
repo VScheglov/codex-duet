@@ -124,6 +124,8 @@ export const zh: Locale = {
   taskCounts: (running: number, queued: number, total: number) => `任务 · ${running} 个运行中 · ${queued} 个排队中 · 共 ${total} 个`,
   parkedForOwner: '交由所有者处理',
   disputes: (n: number) => `争议：${n}`,
+  quoteMissing: '未找到引文',
+  quoteOtherFile: '引文在其他文件中',
   issueCounts: (open: number, parked: number, closed: number) => `问题 · ${open} 个未解决 · ${parked} 个待决定 · ${closed} 个已关闭`,
   closedIssues: (shown: boolean, n: number) => `${shown ? '▾' : '▸'} 已关闭 · ${n}`,
   paneHeading: (kind: string, round: number, max: number) => `codex-duet · ${kind} · 第 ${round}/${max} 轮`,

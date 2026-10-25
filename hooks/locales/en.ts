@@ -125,6 +125,8 @@ export const en = {
   taskCounts: (running: number, queued: number, total: number) => `Tasks · ${running} running · ${queued} queued · ${total} total`,
   parkedForOwner: 'deferred to owner',
   disputes: (n: number) => `disputes: ${n}`,
+  quoteMissing: 'quote missing',
+  quoteOtherFile: 'quote in another file',
   issueCounts: (open: number, parked: number, closed: number) => `Issues · ${open} open · ${parked} deferred · ${closed} closed`,
   closedIssues: (shown: boolean, n: number) => `${shown ? '▾' : '▸'} closed · ${n}`,
   paneHeading: (kind: string, round: number, max: number) => `codex-duet · ${kind} · round ${round}/${max}`,

@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { confirmVerification } from '../scripts/verification.mjs';
+import { checkQuotes } from '../scripts/quotes.mjs';
 import { matchingTests, normalizationTests } from './verification.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -123,6 +124,66 @@ await test('start refuses an empty diff and leaves no session behind', () => {
   assert.equal(r.code, 2);
   assert.match(r.err, /nothing to review/);
   assert.equal(fs.existsSync(home) ? fs.readdirSync(home).length : 0, 0);
+});
+
+await test('quotes: closing and unchanged citations keep their earlier check; open re-citations use the new snapshot', () => {
+  const oldQuote = 'const reviewedStatement = "before the fix";';
+  const newQuote = 'const correctedStatement = "after the fix";';
+  const cited = (iid, status = 'open', extra = {}) => issue(iid, status, 'high', { path: 'a.js', line: 1, quote: oldQuote, ...extra });
+  scriptCodex([
+    turn('revise', Array.from({ length: 6 }, (_, n) => cited(`C${n + 1}`))),
+    turn('revise', [
+      cited('C1', 'resolved'),
+      cited('C2', 'withdrawn'),
+      cited('C3', 'resolved', { path: 'quoted-location.js', quote: 'This new closing citation should not replace the original.' }),
+      cited('C4', 'open', { line: 88 }),
+      cited('C5', 'open', { quote: newQuote }),
+      cited('C6', 'open', { path: 'quoted-location.js' }),
+    ]),
+  ]);
+  const env = { FIXTURE_DECISIONS: JSON.stringify({ 1: 'continue', 2: 'escalate' }) };
+  fs.writeFileSync(path.join(repo, 'a.js'), `${oldQuote}\n`);
+  const start = duet(['start', '--kind', 'code'], { env });
+  assert.equal(start.code, 0, start.err);
+  const sid = sessionId(start.out);
+  const before = state(sid);
+  assert.equal(before.issues.C1.quoteCheck.mark, 'ok');
+  fs.writeFileSync(path.join(repo, 'a.js'), `${newQuote}\n`);
+  fs.writeFileSync(path.join(repo, 'quoted-location.js'), 'const unrelatedStatement = true;\n');
+  const r = duet(['reply', '--session', sid, '--responses', '-'], { env,
+    input: responses('replaced the buggy statement', Object.keys(before.issues).map((iid) => ({ id: iid, action: 'fixed', note: 'a.js:1 now uses the corrected statement.' }))),
+  });
+  assert.equal(r.code, 0, r.err);
+  const after = state(sid);
+  assert.notEqual(after.rounds[0].snapshot.tree, after.rounds[1].snapshot.tree);
+  for (const iid of ['C1', 'C2', 'C3', 'C4']) {
+    const i = after.issues[iid];
+    assert.deepEqual(i.quoteCheck, before.issues[iid].quoteCheck, `${iid} must retain the check of its original citation`);
+    assert.deepEqual([i.path, i.line, i.quote], ['a.js', 1, oldQuote]);
+    assert.deepEqual(i.history.at(-1).quoteCheck, before.issues[iid].quoteCheck);
+    assert.deepEqual(after.rounds[1].quoteChecks[iid], before.issues[iid].quoteCheck);
+  }
+  assert.deepEqual(['C1', 'C2', 'C3', 'C4'].map((iid) => after.issues[iid].status), ['resolved', 'withdrawn', 'resolved', 'open']);
+  for (const [iid, mark] of [['C5', 'ok'], ['C6', 'MISSING']]) {
+    assert.equal(after.issues[iid].quoteCheck.mark, mark);
+    assert.equal(after.issues[iid].quoteCheck.round, 2);
+    assert.equal(after.issues[iid].quoteCheck.tree, after.rounds[1].snapshot.tree);
+    assert.equal(after.issues[iid].status, 'open');
+  }
+  for (const text of [r.out, duet(['status', '--session', sid]).out]) {
+    const closed = text.split('### Closed this round')[1].split('### Open')[0];
+    assert.match(closed, /C1.*resolved/);
+    assert.doesNotMatch(closed, /Quote check:/);
+  }
+  const report = fs.readFileSync(path.join(home, sid, 'report.md'), 'utf8');
+  for (const iid of ['C1', 'C2', 'C3']) {
+    assert.match(report, new RegExp(`\\| ${iid} \\|[^\\n]*\\| ok \\|`));
+    const detail = report.split(`### ${iid} `)[1].split('\n### ')[0];
+    assert.match(detail, /Quote check: ok/);
+    assert.doesNotMatch(detail, /MISSING|other_file:/);
+  }
+  fs.writeFileSync(path.join(repo, 'a.js'), 'export const a = 1;\n');
+  fs.rmSync(path.join(repo, 'quoted-location.js'));
 });
 
 await test('round 1: diff includes untracked files, the sandbox is inherited, focus reaches Codex', () => {
@@ -2083,6 +2144,255 @@ await test('verification: receipt labels never change stop decisions for the sam
       assert.deepEqual(d, baseline);
     }
   }
+});
+
+// ---- quote checks: each citation belongs to the immutable snapshot of its review round
+const quotedIssue = (iid, quote, extra = {}) => issue(iid, 'open', 'high', { path: 'checked.js', line: 2, quote, ...extra });
+let quoteSession;
+let quoteRepo;
+const snapshotQuote = 'const snapshotEvidence = "reviewed content";';
+const changedQuote = 'const newerUnreviewedValue = "after review started";';
+const otherQuote = 'export const otherEvidence = "another file";';
+const otherQuoteFile = 'other\tfile\n数据.js';
+
+await test('quotes: code marks ok, moved, other_file, MISSING and unchecked, using the saved tree despite reviewer writes', () => {
+  quoteRepo = approvalRepo();
+  fs.writeFileSync(path.join(quoteRepo, 'checked.js'), `const a = 1;\n${snapshotQuote}\n`);
+  fs.writeFileSync(path.join(quoteRepo, otherQuoteFile), `${otherQuote}\n`);
+  fs.writeFileSync(path.join(quoteRepo, 'binary.dat'), 'binary\0with a quote inside');
+  const issues = [
+    quotedIssue('C1', snapshotQuote),
+    quotedIssue('C2', snapshotQuote, { line: 88 }),
+    quotedIssue('C3', otherQuote),
+    quotedIssue('C4', 'const inventedEvidence = "not in this snapshot";'),
+    quotedIssue('C5', ''),
+    quotedIssue('C6', '+const a = 1;', { line: 1 }),
+    issue('C7', 'open'), // older reviewer JSON, without the three new fields
+    quotedIssue('C8', snapshotQuote, { path: '' }),
+    quotedIssue('C9', 'with a quote inside', { path: 'binary.dat' }),
+    quotedIssue('C10', snapshotQuote, { line: 0 }),
+    quotedIssue('C11', snapshotQuote, { line: 5 }), // distance 3 is still ok
+    quotedIssue('C12', snapshotQuote, { line: 6 }),
+    quotedIssue('C13', snapshotQuote, { path: '../outside.js' }),
+  ];
+  scriptCodex([{ ...turn('revise', issues), write: { 'checked.js': `${changedQuote}\n`, [otherQuoteFile]: 'gone from disk\n' } }]);
+  const index = fs.readFileSync(path.join(quoteRepo, '.git', 'index'));
+  const r = duet(['start', '--kind', 'code'], { cwd: quoteRepo, env: realPolicy });
+  assert.equal(r.code, 0, r.err);
+  quoteSession = sessionId(r.out);
+  const s = state(quoteSession);
+  const marks = ['ok', 'moved:2', `other_file:${otherQuoteFile}`, 'MISSING', 'unchecked', 'ok', 'unchecked', 'unchecked', 'unchecked', 'ok', 'ok', 'moved:2', 'unchecked'];
+  assert.deepEqual(Object.values(s.issues).map((i) => i.quoteCheck.mark), marks);
+  for (const i of Object.values(s.issues)) {
+    assert.equal(i.quoteCheck.round, 1);
+    assert.equal(i.quoteCheck.tree, s.rounds[0].snapshot.tree);
+    assert.deepEqual(i.history[0].quoteCheck, i.quoteCheck);
+    assert.deepEqual(s.rounds[0].quoteChecks[i.id], i.quoteCheck);
+    assert.equal(i.status, 'open');
+    assert.equal(i.parked, false);
+  }
+  assert.deepEqual([s.issues.C7.path, s.issues.C7.line, s.issues.C7.quote], ['', 0, '']);
+  assert.equal(fs.readFileSync(path.join(quoteRepo, 'checked.js'), 'utf8'), `${changedQuote}\n`);
+  assert.deepEqual(fs.readFileSync(path.join(quoteRepo, '.git', 'index')), index, 'neither snapshotting nor quote checks touch the user index');
+  const status = duet(['status', '--session', quoteSession]);
+  const report = duet(['report', '--session', quoteSession]);
+  assert.equal(report.code, 0, report.err);
+  for (const text of [r.out, status.out, report.out]) {
+    assert.match(text, /Quote check: MISSING — not found in checked\.js at snapshot [\da-f]{10}/);
+    assert.match(text, /Quote check: moved:2 — moved to line 2/);
+    assert.ok(text.includes(`Quote check: other_file:${otherQuoteFile}`), text);
+  }
+  assert.match(report.out, /Quote check: ok/);
+  assert.match(report.out, /Quote check: unchecked/);
+  assert.equal(fs.readFileSync(path.join(home, quoteSession, 'report.md'), 'utf8'), report.out);
+  assert.doesNotMatch(r.out, /Quote check: (?:ok|unchecked)/);
+  assert.match(calls()[0].prompt, /The runner checks each quote against the snapshot/);
+});
+
+await test('quotes: MISSING needs an answer; later citations use their own snapshot and omitted quotes retain their previous check', () => {
+  const before = state(quoteSession);
+  const missingAnswer = duet(['reply', '--session', quoteSession, '--responses', '-'], { input: responses('none', []) });
+  assert.equal(missingAnswer.code, 2);
+  assert.match(missingAnswer.err, /C4/);
+  assert.equal(state(quoteSession).issues.C4.status, 'open');
+  scriptCodex([turn('revise', [
+    ...Object.keys(before.issues).map((iid) => iid === 'C4' ? quotedIssue(iid, changedQuote, { line: 1 }) : issue(iid, 'open')),
+    quotedIssue('C14', snapshotQuote),
+  ])]);
+  const r = duet(['reply', '--session', quoteSession, '--responses', '-'], {
+    input: responses('checked each citation', Object.keys(before.issues).map((iid) => ({ id: iid, action: 'disputed', note: 'Please re-cite against the saved tree.' }))),
+    env: realPolicy,
+  });
+  assert.equal(r.code, 0, r.err);
+  const s = state(quoteSession);
+  assert.equal(s.issues.C4.quoteCheck.mark, 'ok');
+  assert.equal(s.issues.C4.quoteCheck.round, 2);
+  assert.equal(s.issues.C4.quoteCheck.tree, s.rounds[1].snapshot.tree);
+  assert.equal(s.issues.C4.history[0].quoteCheck.mark, 'MISSING');
+  assert.equal(s.issues.C4.history.at(-1).quoteCheck.mark, 'ok');
+  assert.equal(s.issues.C14.quoteCheck.mark, 'MISSING', 'the first snapshot citation no longer exists in round 2');
+  assert.deepEqual(s.issues.C2.quoteCheck, before.issues.C2.quoteCheck);
+  assert.equal(s.issues.C2.quote, snapshotQuote);
+  assert.deepEqual(s.rounds[1].quoteChecks.C2, before.issues.C2.quoteCheck);
+  assert.match(calls()[0].prompt, /Quote check: MISSING/);
+  assert.match(calls()[0].prompt, /Quote check: moved:2/);
+  assert.match(calls()[0].prompt, /Quote check: unchecked/);
+  assert.match(calls()[0].prompt, /<output_contract>[\s\S]*path:[\s\S]*line:[\s\S]*quote:/);
+});
+
+await test('quotes: deduplicate the three longest needles, use short/multiline fallbacks and strip a diff marker once', () => {
+  const dir = approvalRepo();
+  const present = 'const quotedValue = true;';
+  fs.writeFileSync(path.join(dir, 'checked.js'), `${present}\nabc123\nxyz789\n+const actualPlus = true;\n`);
+  const absent = 'const thisLongInventedCitationDoesNotExist = true;';
+  scriptCodex([turn('revise', [
+    quotedIssue('C1', `${absent}\n${absent}\n${present}`, { line: 0 }),
+    quotedIssue('C2', `${absent} 1\n${absent} 2\n${absent} 3\n${present}`),
+    quotedIssue('C3', 'abc123', { line: 2 }),
+    quotedIssue('C4', 'abc123\nxyz789', { line: 2 }),
+    quotedIssue('C5', 'tiny'),
+    quotedIssue('C6', `-${present}`, { line: 1 }),
+    quotedIssue('C7', '+const actualPlus = true;', { line: 4 }),
+    quotedIssue('C8', `  ${present}  `, { line: 1 }),
+    quotedIssue('C9', '++const quotedValue = true;', { line: 1 }),
+    quotedIssue('C10', present, { line: -5 }),
+    quotedIssue('C11', present, { line: 2.5 }),
+  ])]);
+  const r = duet(['start', '--kind', 'code'], { cwd: dir });
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(Object.values(state(sessionId(r.out)).issues).map((i) => i.quoteCheck.mark),
+    ['ok', 'MISSING', 'ok', 'ok', 'unchecked', 'ok', 'ok', 'ok', 'MISSING', 'ok', 'ok']);
+  const { issues } = state(sessionId(r.out));
+  assert.equal(issues.C10.line, 0);
+  assert.equal(issues.C11.line, 0);
+});
+
+await test('quotes: plan/file reviews read snapshot copies and accept a single empty path, listed symlink, relative or absolute path', () => {
+  for (const kind of ['plan', 'file']) {
+    const dir = approvalRepo();
+    const file = path.join(dir, 'source.md');
+    const listed = './listed-plan.md';
+    const quote = 'Keep the exact approved plan wording.';
+    fs.writeFileSync(file, `${quote}\n`);
+    fs.symlinkSync('source.md', path.join(dir, 'listed-plan.md'));
+    scriptCodex([{ ...turn('revise', ['', listed, 'source.md', file].map((p, n) => quotedIssue(`C${n + 1}`, quote, { path: p, line: 1 }))),
+      write: { 'source.md': 'changed while Codex ran\n' } }]);
+    const r = duet(['start', '--kind', kind, '--subject', listed], { cwd: dir });
+    assert.equal(r.code, 0, r.err);
+    const s = state(sessionId(r.out));
+    assert.deepEqual(Object.values(s.issues).map((i) => i.quoteCheck.mark), ['ok', 'ok', 'ok', 'ok']);
+    assert.equal(s.rounds[0].snapshot.docs[0].listed, listed);
+    assert.equal(fs.readFileSync(file, 'utf8'), 'changed while Codex ran\n');
+    assert.equal(fs.readFileSync(s.rounds[0].snapshot.docs[0].snap, 'utf8'), `${quote}\n`);
+  }
+});
+
+await test('quotes: multi-file reviews search only saved subject copies, with no default for an empty or unrelated path', () => {
+  const dir = approvalRepo();
+  fs.writeFileSync(path.join(dir, 'first.md'), 'First subject file has its own text.\n');
+  fs.writeFileSync(path.join(dir, 'second.md'), 'Second subject file holds the evidence.\nabc123\nxyz789\n');
+  fs.writeFileSync(path.join(dir, 'outside.md'), 'This file is outside the review subject.\n');
+  scriptCodex([{ ...turn('revise', [
+    quotedIssue('C1', 'Second subject file holds the evidence.', { path: 'first.md' }),
+    quotedIssue('C2', 'This file is outside the review subject.', { path: 'first.md' }),
+    quotedIssue('C3', 'First subject file has its own text.', { path: '' }),
+    quotedIssue('C4', 'First subject file has its own text.', { path: 'outside.md' }),
+    quotedIssue('C5', 'abc123\nxyz789', { path: 'first.md' }),
+    quotedIssue('C6', 'abc123\nabsent', { path: 'first.md' }),
+  ]), write: { 'second.md': 'no longer on disk\n' } }]);
+  const r = duet(['start', '--kind', 'file', '--subject', 'first.md', '--subject', 'second.md'], { cwd: dir });
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(Object.values(state(sessionId(r.out)).issues).map((i) => i.quoteCheck.mark),
+    ['other_file:second.md', 'MISSING', 'unchecked', 'unchecked', 'other_file:second.md', 'MISSING']);
+});
+
+await test('quotes: build review checks the reviewed tree, sends anomalies to Codex, and accepts legacy Claude reviews', () => {
+  const { sid, worktree } = approvalBuild({ steps: [author('answered the review', [
+    { id: 'C1', action: 'fixed', note: 'Checked the reviewed snapshot.' },
+    { id: 'C2', action: 'disputed', note: 'Please re-cite.' },
+  ])] });
+  const tree = state(sid).rounds[0].snapshot.tree;
+  fs.writeFileSync(path.join(worktree, 'reviewed.txt'), `${changedQuote}\n`);
+  const r = duet(['review', '--session', sid, '--issues', '-'], { input: reviewJSON('revise', [
+    quotedIssue('C1', 'approved', { path: 'reviewed.txt', line: 1 }),
+    quotedIssue('C2', changedQuote, { path: 'reviewed.txt', line: 1 }),
+  ]), env: realPolicy });
+  assert.equal(r.code, 0, r.err);
+  const s = state(sid);
+  assert.equal(s.issues.C1.quoteCheck.mark, 'ok');
+  assert.equal(s.issues.C2.quoteCheck.mark, 'MISSING');
+  assert.equal(s.issues.C2.quoteCheck.tree, tree);
+  assert.equal(s.issues.C2.quoteCheck.round, 1);
+  assert.deepEqual(s.rounds[0].quoteChecks.C2, s.issues.C2.quoteCheck);
+  assert.match(calls()[1].prompt, /Quote check: MISSING — not found in reviewed\.txt/);
+  assert.match(r.out, /Quote check: MISSING/);
+  const approved = approveBuild(sid, [
+    reviewIssue('C1', 'resolved', { path: 'reviewed.txt', line: 1, quote: 'approved' }),
+    reviewIssue('C2', 'resolved'),
+  ]);
+  assert.match(approved.out, /Decision: DONE/);
+  assert.deepEqual(state(sid).issues.C1.quoteCheck, s.issues.C1.quoteCheck, 'a closing build review keeps the original citation check');
+  assert.deepEqual(state(sid).issues.C2.quoteCheck, s.issues.C2.quoteCheck, 'a legacy review does not erase the last check');
+  assert.equal(duet(['discard', '--session', sid]).code, 0);
+});
+
+await test('quotes: Claude checks post-approval review citations against that round, without a Codex turn', () => {
+  const { sid, worktree } = approvalBuild({ maxRounds: 2 });
+  approveBuild(sid);
+  const drift = 'const postApprovalEvidence = "review this drift";';
+  fs.writeFileSync(path.join(worktree, 'reviewed.txt'), `${drift}\n`);
+  assert.equal(duet(['finish', '--session', sid]).code, 0);
+  const round = state(sid).rounds.at(-1);
+  fs.writeFileSync(path.join(worktree, 'reviewed.txt'), `${changedQuote}\n`);
+  const r = duet(['review', '--session', sid, '--issues', '-'], { input: reviewJSON('revise', [
+    quotedIssue('C1', drift, { path: 'reviewed.txt', line: 1 }),
+    quotedIssue('C2', changedQuote, { path: 'reviewed.txt', line: 1 }),
+  ]), env: realPolicy });
+  assert.equal(r.code, 0, r.err);
+  const s = state(sid);
+  assert.equal(s.issues.C1.quoteCheck.mark, 'ok');
+  assert.equal(s.issues.C2.quoteCheck.mark, 'MISSING');
+  assert.equal(s.issues.C1.quoteCheck.tree, round.snapshot.tree);
+  assert.equal(s.issues.C1.quoteCheck.round, 2);
+  assert.equal(s.rounds.at(-1).kind, 'post-approval');
+  assert.equal(calls().length, 1);
+  assert.match(r.out, /Quote check: MISSING/);
+  assert.equal(duet(['discard', '--session', sid]).code, 0);
+});
+
+await test('quotes: MISSING never changes issue state or stop decisions, including approve with an open medium issue', () => {
+  for (const [verdict, severity] of [['revise', 'high'], ['approve', 'medium']]) {
+    let baseline;
+    for (const citation of [{}, { path: 'checked.js', line: 1, quote: 'This invented evidence is nowhere in the snapshot.' }]) {
+      scriptCodex([turn(verdict, [issue('C1', 'open', severity, citation)])]);
+      const r = duet(['start', '--kind', 'code'], { cwd: quoteRepo, env: realPolicy });
+      assert.equal(r.code, 0, r.err);
+      const s = state(sessionId(r.out));
+      baseline ??= s.decision;
+      assert.deepEqual(s.decision, baseline);
+      assert.equal(s.issues.C1.status, 'open');
+      assert.equal(s.issues.C1.parked, false);
+      assert.equal(s.issues.C1.disputes, 0);
+      assert.equal(s.issues.C1.quoteCheck.mark, citation.quote ? 'MISSING' : 'unchecked');
+    }
+  }
+});
+
+await test('quotes: unavailable trees/files and binary document copies are unchecked; older snapshots need no new metadata', () => {
+  const mark = (kind, snapshot, extra = {}) => checkQuotes({ kind, cwd: quoteRepo, issues: {} }, {
+    issues: [quotedIssue('C1', snapshotQuote, extra)],
+  }, snapshot, 1).C1.mark;
+  assert.equal(mark('code', undefined), 'unchecked');
+  assert.equal(mark('code', { tree: 'f'.repeat(40) }), 'unchecked');
+  const tree = state(quoteSession).rounds[0].snapshot.tree;
+  assert.equal(mark('code', { tree }, { path: 'nonexistent.js' }), 'unchecked');
+  assert.equal(mark('file', { docs: [{ path: 'source.md', snap: path.join(tmp, 'missing-copy'), exists: true }] }, { path: '' }), 'unchecked');
+  const snap = path.join(tmp, 'legacy-doc-copy');
+  fs.writeFileSync(snap, `${snapshotQuote}\n`);
+  const oldSnapshot = { docs: [{ path: path.join(quoteRepo, 'source.md'), snap, exists: true }] };
+  assert.equal(mark('plan', oldSnapshot, { path: 'source.md', line: 1 }), 'ok');
+  fs.writeFileSync(snap, `binary\0${snapshotQuote}`);
+  assert.equal(mark('file', oldSnapshot, { path: '' }), 'unchecked');
 });
 
 // ---- the user's stop policy (scripts/policy.mjs): one case per rule, plus rule order

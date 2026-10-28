@@ -1023,6 +1023,24 @@ for (const [language, done, labels, skipped, failed, gaps] of [
   });
 }
 
+await test('ru: a check fed a script on a here-document is named by what it runs, never by its whole source', async () => {
+  const { engine, write } = await languageEngine({ language: 'ru' });
+  const script = "python3 - <<'PY'\nfrom pathlib import Path\nassert Path('a.txt').read_text() == 'x', 'differs'\nprint('PASS')\nPY";
+  write({
+    ...buildOf('heredoc'), phase: 'done', round: 1,
+    rounds: [{ n: 1, verdict: 'approve', verification: { label: 'partial', gaps: ['Browser path not inspected'], checks: [
+      { command: script, outcome: 'passed', note: '', confirmation: 'unconfirmed', event: { command: script, exit_code: 0, status: 'completed' } },
+      { command: `npm run e2e -- ${'--grep slow '.repeat(12)}`, outcome: 'skipped', note: 'No browser', confirmation: 'skipped' },
+    ] } }],
+    decision: { action: 'done', reason: 'Approved', issues: [] }, issues: {},
+  });
+  await engine.tick();
+  const pane = lines(await engine.render('Pane'));
+  assert.ok(pane.some((line) => line.startsWith('не подтверждено: запускает скрипт Python (exit 0)')), pane.join('\n'));
+  assert.ok(pane.some((line) => line.includes('пропущено: npm run e2e')), pane.join('\n'));
+  assert.ok(!pane.some((line) => line.includes('read_text') || line.includes('--grep slow '.repeat(8))), pane.join('\n'));
+});
+
 await test('the default option draws English with an English locale and with no locale available', async () => {
   for (const env of [{ LANG: 'en_US.UTF-8' }, {}]) {
     const { engine } = await languageEngine(undefined, env);

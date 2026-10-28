@@ -71,6 +71,27 @@ export async function matchingTests(test, dir) {
     { name: 'an opaque exact command cannot bypass masking rules', claim: 'npm test || true # note', events: [['npm test || true # note', 0]], want: 'unconfirmed' },
     { name: 'quoted pipes in arguments keep the single command exit', claim: "node x --name 'a|b'", events: [["node x --name 'a|b'", 0]], want: 'confirmed' },
     { name: 'an exact failed compound event keeps its complete command exit', claim: 'cd pkg && npm test', events: [['cd pkg && npm test', 1]], want: 'contradicted' },
+    // a here-document body is the program's data, not shell: the exit is the program's
+    ...(() => {
+      const script = "python3 - <<'PY'\nimport sys\n# a comment, not shell: || true\nsys.exit(0)\nPY";
+      return [
+        { name: 'a script fed on a here-document is confirmed by its exit', claim: script, events: [[script, 0]], want: 'confirmed' },
+        { name: 'a failing here-document script contradicts passed', claim: script, events: [[script, 1]], want: 'contradicted' },
+        { name: 'another script with the same first line cannot confirm a check', claim: script,
+          events: [["python3 - <<'PY'\nprint('other')\nPY", 0]], want: 'unconfirmed' },
+        { name: 'a pipe after a here-document hides its exit', claim: "python3 - <<'PY' | tail -1\nprint(1)\nPY",
+          events: [["python3 - <<'PY' | tail -1\nprint(1)\nPY", 0]], want: 'unconfirmed' },
+        { name: 'a command after a here-document hides its exit', claim: `${script}\necho done`, events: [[`${script}\necho done`, 0]], want: 'unconfirmed' },
+        { name: 'a shell fed a here-document runs its body as commands', claim: "bash <<'EOF'\nnpm test || true\nEOF",
+          events: [["bash <<'EOF'\nnpm test || true\nEOF", 0]], want: 'unconfirmed' },
+        { name: 'an unquoted here-document runs substitutions out of the exit\'s sight', claim: "python3 - <<PY\nprint('$(npm test || true)')\nPY",
+          events: [["python3 - <<PY\nprint('$(npm test || true)')\nPY", 0]], want: 'unconfirmed' },
+        { name: 'an unterminated here-document proves nothing', claim: "python3 - <<'PY'\nprint(1)", events: [["python3 - <<'PY'\nprint(1)", 0]], want: 'unconfirmed' },
+        { name: 'a here-document with <<- may indent its delimiter with tabs', claim: "node - <<-'JS'\n\tconsole.log(1)\n\tJS",
+          events: [["node - <<-'JS'\n\tconsole.log(1)\n\tJS", 0]], want: 'confirmed' },
+        { name: 'a here-string keeps the command exit', claim: "python3 - <<< 'print(1)'", events: [["python3 - <<< 'print(1)'", 0]], want: 'confirmed' },
+      ];
+    })(),
     ...[['||', 'unconfirmed'], [';', 'confirmed'], ['|', 'unconfirmed'], ['\n', 'confirmed']].map(([op, want]) => ({
       name: `exit evidence for a final segment after ${JSON.stringify(op)}`, claim: 'npm test', events: [[`false ${op} npm test`, 0]], want })),
     { name: 'separate OR components do not bypass masking rules', claim: 'npm test || npm run lint',
@@ -96,6 +117,15 @@ export async function matchingTests(test, dir) {
       }
     });
   }
+  await test('verification matching: a here-document script in the double-quoted wrapper Codex logs is confirmed', async () => {
+    // Codex logs `/bin/zsh -lc "python3 - <<'PY' … PY"`; the check names the script as written.
+    const script = "python3 - <<'PY'\nfrom pathlib import Path\nassert Path('a.txt').read_text() == \"x\", 'differs'\nprint('PASS')\nPY";
+    fs.writeFileSync(file, JSON.stringify({ type: 'item.completed', item: { type: 'command_execution',
+      command: `/bin/zsh -lc "${script.replace(/["\\$`]/g, '\\$&')}"`, exit_code: 0, status: 'completed' } }));
+    const receipt = await confirmVerification({ checks: [{ command: script, outcome: 'passed', note: '' }], gaps: [] }, file);
+    assert.equal(receipt.checks[0].confirmation, 'confirmed');
+    assert.equal(receipt.label, 'executed');
+  });
 }
 
 export async function normalizationTests(test, dir) {

@@ -67,6 +67,12 @@ function phaseWithVerification(view: DuetView) {
   return `${phaseLabel(view.phase)}${label ? ` · ${label}` : ''}`
 }
 
+// A check is named as Codex typed it while that is one short line; a script fed on stdin or a long chain
+// is named by what it does, or its whole source would fill the pane.
+const CHECK_COMMAND_MAX = 100
+const checkCommand = (command: string) =>
+  (/\n/.test(command.trim()) || oneLine(command).length > CHECK_COMMAND_MAX ? describeCommand(command) : oneLine(command))
+
 // Up to two detail lines explain why the last Codex turn was only partly verified.
 function verificationDetails(view: DuetView) {
   const receipt = view.verification
@@ -77,7 +83,7 @@ function verificationDetails(view: DuetView) {
       : check.outcome === 'failed' ? 'failed' : null
     if (!status) return []
     const exit = check.event?.exit_code
-    return [`${locale.verificationChecks[status]}: ${oneLine(check.command)}${exit != null ? ` (exit ${exit})` : ''}${check.note ? ` — ${oneLine(check.note)}` : ''}`]
+    return [`${locale.verificationChecks[status]}: ${checkCommand(check.command)}${exit != null ? ` (exit ${exit})` : ''}${check.note ? ` — ${oneLine(check.note)}` : ''}`]
   })
   return [checks.join('; '), receipt.gaps.length ? locale.verificationGaps(receipt.gaps.map(oneLine).join('; ')) : ''].filter(Boolean)
 }
@@ -166,7 +172,8 @@ function describeCommand(raw: string) {
     ?? /(?:sed -n '?[\d,;p]+'?|\bcat|\bnl -ba|\b(?:head|tail)(?:\s+-(?:[nc]\s*)?\d+)?)\s+(?!-)([^\s|;&<>]+)/.exec(cmd)?.[1]
   if (file && lines) return locale.readsLines(tail(file), lines[1], lines[2])
   if (file) return locale.readsFile(tail(file))
-  const search = /\b(?:rg|grep)\b(?:\s+-[\w-]+)*\s+(?:'([^']+)'|"([^"]+)"|(\S+))/.exec(cmd)
+  // rg or grep as the command it runs, not an option of another one (`npm run e2e -- --grep slow`)
+  const search = /(?:^|[\s;&|(])(?:\S*\/)?(?:rg|grep)\b(?:\s+-[\w-]+)*\s+(?:'([^']+)'|"([^"]+)"|(\S+))/.exec(cmd)
   if (search && !/--files/.test(cmd)) return locale.searches(clip(search[1] ?? search[2] ?? search[3], 40))
   if (/\bcodex\b[\s\S]*--help/.test(cmd)) return locale.checksHelp
   const gitCmd = /\bgit (diff|log|status|blame|ls-files|rev-parse|show)\b/.exec(cmd)

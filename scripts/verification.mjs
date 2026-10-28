@@ -55,8 +55,14 @@ function unwrapCommand(raw) {
 
 const oneLine = (command) => command.replace(/\s+/g, ' ').trim();
 
+// A shell reading its script from a here-document runs the body as commands, so the body's own
+// masking (`|| true`, a later echo) decides the exit; any other program reads the body as data.
+const SHELL = /^(?:\S*\/)?(?:sh|bash|zsh|dash|ksh|mksh|fish)$/;
+
 // Split only top-level shell operators, not quoted arguments or substitutions. Unsupported
-// syntax keeps an exact-match key, but cannot prove a verification's outcome.
+// syntax keeps an exact-match key, but cannot prove a verification's outcome. A here-document
+// body (`python3 - <<'PY' … PY`) stays verbatim in its segment, so only the same script
+// matches, and its lines are never read as shell.
 function commandParts(raw) {
   const command = unwrapCommand(raw);
   const segments = [];
@@ -67,6 +73,7 @@ function commandParts(raw) {
   let start = 0;
   let simple = true;
   let unsupported = false;
+  let heredocs = []; // here-documents opened on the current line; their bodies follow its newline
   const addSegment = (end) => {
     const text = oneLine(command.slice(start, end));
     if (text) segments.push({ command: text, simple });
@@ -77,8 +84,42 @@ function commandParts(raw) {
     if (c === '\\' && quote !== "'") { i += 1; continue; }
     if (quote) { if (c === quote) quote = ''; continue; }
     if (c === "'" || c === '"' || c === '`') { quote = c; continue; }
-    if ((c === '#' && (i === 0 || /\s/.test(command[i - 1]))) || command.startsWith('<<', i)
-      || command.startsWith("$'", i)) return opaque();
+    if ((c === '#' && (i === 0 || /\s/.test(command[i - 1]))) || command.startsWith("$'", i)) return opaque();
+    if (command.startsWith('<<<', i)) { simple = false; i += 2; continue; } // a here-string: one word of data
+    if (command.startsWith('<<', i)) {
+      const doc = /^<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|(\\?)([^\s;&|<>()'"`]+))/.exec(command.slice(i));
+      if (!doc || depth) return opaque();
+      heredocs.push({ delimiter: doc[2] ?? doc[3] ?? doc[5], tabs: doc[1] === '-', quoted: doc[5] === undefined || doc[4] === '\\' });
+      simple = false;
+      i += doc[0].length - 1;
+      continue;
+    }
+    if (c === '\n' && heredocs.length && !depth) {
+      // The bodies come in the order they were opened, each up to a line holding only its delimiter.
+      const head = oneLine(command.slice(start, i));
+      let pos = i + 1;
+      for (const doc of heredocs) {
+        for (;;) {
+          if (pos > command.length) return opaque();
+          const end = command.indexOf('\n', pos);
+          const line = command.slice(pos, end === -1 ? command.length : end);
+          pos = end === -1 ? command.length + 1 : end + 1;
+          if ((doc.tabs ? line.replace(/^\t+/, '') : line) === doc.delimiter) break;
+          if (end === -1) return opaque(); // the delimiter never comes
+          // an unquoted body still runs $(…) and `…` in the outer shell, out of the exit's sight
+          if (!doc.quoted && /\$\(|`/.test(line)) unsupported = true;
+        }
+      }
+      if (SHELL.test(head.replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, '').split(' ')[0])) unsupported = true;
+      segments.push({ command: `${head}\n${command.slice(i + 1, pos - 1)}`, simple: false });
+      simple = true;
+      heredocs = [];
+      // the newline after the last delimiter separates commands like any other
+      if (command.slice(pos).trim()) operators.push('\n');
+      start = pos;
+      i = pos - 1;
+      continue;
+    }
     if (c === '(' || c === '{') { depth += 1; simple = false; unsupported = true; continue; }
     if (c === ')' || c === '}') { if (!depth) return opaque(); depth -= 1; continue; }
     if (depth) continue;
@@ -96,7 +137,7 @@ function commandParts(raw) {
       if (c === '&' && !['<', '>'].includes(command[i - 1]) && command[i + 1] !== '>') unsupported = true;
     }
   }
-  if (quote || depth) return opaque();
+  if (quote || depth || heredocs.length) return opaque();
   addSegment(command.length);
   return { key: JSON.stringify([segments.map((s) => s.command), operators]), segments, operators, unsupported };
 }
